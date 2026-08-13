@@ -147,7 +147,14 @@
 					Step <span class="tabular-nums">{flasher.stepIndex + 1} of {flasher.totalSteps}</span>:
 					{flasher.stepLabel}
 				</p>
-				{#if flasher.stepProgress && flasher.stepProgress.totalBytes > 0}
+				{#if flasher.stepPhase === 'writing'}
+					<!-- fastboot reports nothing while the device commits a chunk, so
+					     the bar is legitimately stuck for a moment here. -->
+					<p class="flex items-center gap-2.5 text-base/7 text-muted-foreground sm:text-sm/6">
+						<Spinner class="text-primary" />
+						<span>Writing to device</span>
+					</p>
+				{:else if flasher.stepProgress && flasher.stepProgress.totalBytes > 0}
 					<p class="text-base/7 text-muted-foreground tabular-nums sm:text-sm/6">
 						{formatRate(flasher.stepProgress.rateKiBps * 1024)} · about {formatEta(
 							flasher.stepProgress.etaMs

@@ -24,11 +24,20 @@ import { Fastboot } from '$lib/fastboot/client';
 import type { FlashArchive } from './archive';
 import { ProgressTracker, StreamChunker, type FlashProgress, type StreamSource } from './types';
 
+/**
+ * Which half of a chunk's round trip is running.
+ *
+ * Only `uploading` has a progress signal — fastboot reports nothing while the
+ * device commits a chunk, so the UI needs to say what the stalled bar means.
+ */
+export type StepPhase = 'uploading' | 'writing';
+
 export interface StepEvent {
 	stepIndex: number;
 	totalSteps: number;
 	label: string;
 	progress?: FlashProgress;
+	phase?: StepPhase;
 }
 
 export interface RunnerCallbacks {
@@ -48,11 +57,16 @@ const SECTOR_BYTES = 512;
 const RAW_ALIAS = 'tb';
 
 /**
- * Host-side chunk ceiling. The device will usually accept 112 MiB
- * (CONFIG_FASTBOOT_BUF_SIZE), but holding that much in a browser tab per chunk
- * is wasteful and makes progress reporting lumpy.
+ * Host-side chunk ceiling.
+ *
+ * The device would accept 112 MiB (CONFIG_FASTBOOT_BUF_SIZE), but a chunk is a
+ * strictly serialized round trip — upload, then a blocking `flash:` while the
+ * eMMC commits it, with no progress reported for the second half. At 32 MiB
+ * that write is a 3-5 second dead stop; at 8 MiB it's under a second, which
+ * reads as continuous. The extra `setenv`+`flash` round trips cost microseconds
+ * each, and total transfer time is unchanged either way.
  */
-const MAX_CHUNK_BYTES = 32 * 1024 * 1024;
+const MAX_CHUNK_BYTES = 8 * 1024 * 1024;
 
 /** CONFIG_FASTBOOT_BUF_ADDR on our u-boot — where a download lands in DRAM. */
 const FASTBOOT_BUF_ADDR = 0x6000000;
@@ -174,8 +188,8 @@ export async function runFlashConfig(
 
 	for (const [stepIndex, step] of config.steps.entries()) {
 		signal?.throwIfAborted();
-		const emit = (progress?: FlashProgress) =>
-			onStep?.({ stepIndex, totalSteps, label: stepLabel(step), progress });
+		const emit = (progress?: FlashProgress, phase?: StepPhase) =>
+			onStep?.({ stepIndex, totalSteps, label: stepLabel(step), progress, phase });
 		emit();
 		const sparse = sparseFlag(step) || forceSparse === true;
 
@@ -203,8 +217,9 @@ export async function runFlashConfig(
 				const tracker = new ProgressTracker(bytes.byteLength);
 				await fastboot.download(bytes, {
 					signal,
-					onProgress: (sent) => emit(tracker.snapshot(sent))
+					onProgress: (sent) => emit(tracker.snapshot(sent), 'uploading')
 				});
+				emit(tracker.snapshot(bytes.byteLength), 'writing');
 				await fastboot.flash(target);
 				tracker.markWritten(bytes.byteLength);
 				emit(tracker.snapshot());
@@ -302,7 +317,7 @@ export async function runFlashConfig(
 interface WriteOptions {
 	sparse?: boolean;
 	signal?: AbortSignal;
-	onProgress?: (progress: FlashProgress) => void;
+	onProgress?: (progress: FlashProgress, phase?: StepPhase) => void;
 }
 
 /**
@@ -347,8 +362,11 @@ async function flashRaw(
 			await fastboot.setRawTarget(RAW_ALIAS, lba, sectors);
 			await fastboot.download(padToSector(chunk), {
 				signal,
-				onProgress: (sent) => onProgress?.(tracker.snapshot(sent))
+				onProgress: (sent) => onProgress?.(tracker.snapshot(sent), 'uploading')
 			});
+			// The bar can't move while the device commits the chunk, so hold it at
+			// the end of what we uploaded and let the UI explain the pause.
+			onProgress?.(tracker.snapshot(length), 'writing');
 			await fastboot.flash(RAW_ALIAS);
 			tracker.markWritten(length);
 			onProgress?.(tracker.snapshot());
@@ -387,8 +405,9 @@ async function flashByName(
 		const bytes = await chunker.read(source.size);
 		await fastboot.download(bytes, {
 			signal,
-			onProgress: (sent) => onProgress?.(tracker.snapshot(sent))
+			onProgress: (sent) => onProgress?.(tracker.snapshot(sent), 'uploading')
 		});
+		onProgress?.(tracker.snapshot(source.size), 'writing');
 		await fastboot.flash(name);
 		tracker.markWritten(source.size);
 		onProgress?.(tracker.snapshot());
