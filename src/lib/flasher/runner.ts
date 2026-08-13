@@ -22,7 +22,12 @@
 import type { DataOrFile, FlashConfig, FlashStep, StringOrFile } from 'libsuperbird/meta';
 import type { Bytes } from '$lib/bytes';
 import { Fastboot } from '$lib/fastboot/client';
-import { toBootImage } from '$lib/fastboot/boot-image';
+import {
+	INFO_SECTOR_BYTES,
+	infoSector,
+	needsInfoSector,
+	toBootImage
+} from '$lib/fastboot/boot-image';
 import type { FlashArchive } from './archive';
 import { ProgressTracker, StreamChunker, type FlashProgress, type StreamSource } from './types';
 
@@ -224,6 +229,72 @@ async function sourceFor(archive: FlashArchive, data: DataOrFile): Promise<Strea
 	return archive.sourceOf(data.filePath);
 }
 
+/** Leading bytes we need in hand to recognise a bare bootloader image. */
+const BOOTLOADER_PROBE_BYTES = 8;
+
+/**
+ * Give a bootloader image its info sector on the way to LBA 0, if it hasn't got
+ * one already.
+ *
+ * A raw write at LBA 0 is a bootloader write — that's where the mask ROM looks,
+ * and it expects a 512-byte info sector first, with BL2 itself starting at LBA
+ * 1. Vendor u-boot builds that sector as part of `amlmmc write bootloader`, so
+ * archives written against burn mode carry a *bare* dump and never mention it.
+ * Written raw here every byte lands one sector early, and the device sits at a
+ * black screen with the whole image reading back correct — the most expensive
+ * mistake available on this path.
+ *
+ * Rather than require every published archive be rebuilt, we sniff for it. Only
+ * a payload starting with the encrypted BL2 header counts as bare, so anything
+ * already in on-disk form goes through untouched — including `unbrick.bin`,
+ * which is a whole-disk image that opens with its own (zeroed) info sector.
+ */
+export async function withInfoSector(
+	source: StreamSource,
+	onLog?: (message: string) => void
+): Promise<StreamSource> {
+	const reader = source.stream.getReader();
+	const pending: Uint8Array[] = [];
+	let probed = 0;
+	while (probed < BOOTLOADER_PROBE_BYTES) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		pending.push(value);
+		probed += value.byteLength;
+	}
+
+	const probe = new Uint8Array(probed);
+	for (let offset = 0, index = 0; index < pending.length; index++) {
+		probe.set(pending[index], offset);
+		offset += pending[index].byteLength;
+	}
+
+	const bare = needsInfoSector(probe);
+	if (bare) {
+		onLog?.('the bootloader image has no info sector, adding one so BL2 lands at sector 1');
+		pending.unshift(infoSector());
+	}
+
+	return {
+		size: bare ? source.size + INFO_SECTOR_BYTES : source.size,
+		stream: new ReadableStream<Uint8Array>({
+			async pull(controller) {
+				const buffered = pending.shift();
+				if (buffered) {
+					controller.enqueue(buffered);
+					return;
+				}
+				const { done, value } = await reader.read();
+				if (done) controller.close();
+				else controller.enqueue(value);
+			},
+			cancel(reason) {
+				return reader.cancel(reason);
+			}
+		})
+	};
+}
+
 export async function runFlashConfig(
 	fastboot: Fastboot,
 	config: FlashConfig,
@@ -249,14 +320,20 @@ export async function runFlashConfig(
 				if (step.value.type === 'time') await sleep(step.value.time);
 				break;
 
-			case 'writeUserArea':
-				await flashRaw(fastboot, step.value.lba, await sourceFor(archive, step.value.data), {
+			case 'writeUserArea': {
+				let source = await sourceFor(archive, step.value.data);
+				// A raw write at LBA 0 is a bootloader write, and burn-mode archives
+				// carry a bare dump because vendor u-boot built the info sector for
+				// them. Add it here if it's missing.
+				if (step.value.lba === 0) source = await withInfoSector(source, onLog);
+				await flashRaw(fastboot, step.value.lba, source, {
 					sparse,
 					signal,
 					onProgress: emit,
 					onLog
 				});
 				break;
+			}
 
 			case 'writeBootPartition': {
 				const data = await dataBytes(archive, step.value.data);
