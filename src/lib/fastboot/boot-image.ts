@@ -29,12 +29,47 @@ export const INFO_SECTOR_BYTES = 512;
 export const BOOT_IMAGE_BYTES = 4 * 1024 * 1024;
 
 /**
- * Leading bytes shared by every signed amlogic bootloader image we handle — the
- * encrypted BL2 header. A stock `bootloader.dump`, `superbird.bootloader.img`
- * and `superbird.bl2.encrypted.bin` all begin with these, which is what makes it
- * a usable "is this a bare image?" test.
+ * First bytes of the *stock* Car Thing BL2.
+ *
+ * Kept only as a cross-check and a landmark when reading hex dumps. It is
+ * tempting to use as an "is this a bare image?" test — every bootloader we
+ * shipped starts with it — but they are all derived from the same stock BL2,
+ * and BL2 is encrypted, so these are one build's first ciphertext block rather
+ * than a magic. A differently-signed bootloader (an 8.9.2 thinglabs dump, say)
+ * shares none of it. Testing for it treats every other build as already
+ * prepared, which is the one mistake on this path that produces a black screen.
  */
-const BL2_SIGNATURE = [0x0c, 0x62, 0x7a, 0x15, 0xbe, 0x94, 0x07, 0xb2];
+export const STOCK_BL2_PREFIX = [0x0c, 0x62, 0x7a, 0x15, 0xbe, 0x94, 0x07, 0xb2];
+
+/** Offset past the info sector's defined fields; everything from here is reserved. */
+const INFO_SECTOR_RESERVED_FROM = 0x18;
+
+/**
+ * Whether `data` already opens with an info sector.
+ *
+ * Detecting the sector is far more reliable than detecting the bootloader
+ * behind it. BL2 is encrypted, so its leading bytes differ per build and per
+ * signing key and can't be recognised at all; an info sector is a fixed shape —
+ * a handful of small header fields, ~480 bytes of zero padding, and a checksum
+ * of everything ahead of it in the last word. High-entropy ciphertext does not
+ * accidentally take that shape.
+ *
+ * An all-zero sector passes too, which is intended: that is what `unbrick.bin`
+ * and other whole-disk images carry at LBA 0, and it boots.
+ */
+function hasInfoSector(data: Bytes): boolean {
+	if (data.byteLength < INFO_SECTOR_BYTES) return false;
+	for (let offset = INFO_SECTOR_RESERVED_FROM; offset < INFO_SECTOR_BYTES - 4; offset++) {
+		if (data[offset] !== 0) return false;
+	}
+
+	const view = new DataView(data.buffer, data.byteOffset, INFO_SECTOR_BYTES);
+	let checksum = 0;
+	for (let offset = 0; offset < INFO_SECTOR_BYTES - 4; offset += 4) {
+		checksum = (checksum + view.getUint32(offset, true)) >>> 0;
+	}
+	return checksum === view.getUint32(INFO_SECTOR_BYTES - 4, true);
+}
 
 /**
  * Build the info sector for a Car Thing.
@@ -65,10 +100,17 @@ export function infoSector(): Uint8Array {
 	return sector;
 }
 
-/** Whether `data` is a bare bootloader image that still needs an info sector in front of it. */
+/**
+ * Whether `data` is a bare bootloader image that still needs an info sector in
+ * front of it — i.e. anything that isn't already carrying one.
+ *
+ * Defaulting to "bare" is deliberate. Getting it wrong in this direction writes
+ * a spurious 512 bytes ahead of an image that didn't need it, which is visible
+ * immediately; getting it wrong the other way puts a whole bootloader one sector
+ * early, where every byte reads back correct and the device just never boots.
+ */
 export function needsInfoSector(data: Bytes): boolean {
-	if (data.byteLength < BL2_SIGNATURE.length) return false;
-	return BL2_SIGNATURE.every((byte, index) => data[index] === byte);
+	return !hasInfoSector(data);
 }
 
 /**

@@ -229,8 +229,11 @@ async function sourceFor(archive: FlashArchive, data: DataOrFile): Promise<Strea
 	return archive.sourceOf(data.filePath);
 }
 
-/** Leading bytes we need in hand to recognise a bare bootloader image. */
-const BOOTLOADER_PROBE_BYTES = 8;
+/**
+ * Leading bytes we need in hand to tell a bare bootloader image from a prepared
+ * one — a whole sector, since the test is "does an info sector start here?".
+ */
+const BOOTLOADER_PROBE_BYTES = INFO_SECTOR_BYTES;
 
 /**
  * Give a bootloader image its info sector on the way to LBA 0, if it hasn't got
@@ -387,7 +390,7 @@ export async function runFlashConfig(
 
 			case 'writeEnv': {
 				const text = await textValue(archive, step.value);
-				await writeEnv(fastboot, text, { signal });
+				await writeEnv(fastboot, text, { signal, onLog });
 				break;
 			}
 
@@ -627,11 +630,22 @@ async function flashByName(
  * place, which sidesteps the 64-byte command limit that a `setenv` per
  * variable would keep running into. Our u-boot keeps its environment in
  * `uboot.env` on the FAT `env` partition, so `saveenv` is what makes it stick.
+ *
+ * That lookup goes through the GPT, and mainline u-boot cannot read the amlogic
+ * partition table. An archive restoring a vendor layout therefore leaves no
+ * `env` partition we can see and `saveenv` has nowhere to go — which is an
+ * expected outcome of that restore rather than a failed flash, so it's reported
+ * and stepped over. The import itself still applied, and a vendor-layout device
+ * reads its environment from the `env` partition the archive restored anyway.
  */
 export async function writeEnv(
 	fastboot: Fastboot,
 	env: string,
-	options: { signal?: AbortSignal; save?: boolean } = {}
+	options: {
+		signal?: AbortSignal;
+		save?: boolean;
+		onLog?: (message: string) => void;
+	} = {}
 ): Promise<void> {
 	const normalised = env.endsWith('\n') ? env : `${env}\n`;
 	const bytes = new TextEncoder().encode(normalised);
@@ -644,11 +658,22 @@ export async function writeEnv(
 	}
 	if (options.save !== false) {
 		const saved = await fastboot.console('saveenv');
-		if (/error|failed/i.test(saved)) {
+		if (NO_ENV_PARTITION.test(saved)) {
+			options.onLog?.(
+				'there is no env partition this bootloader can see, so the environment was not saved — ' +
+					'expected when the image being restored uses the amlogic partition table'
+			);
+		} else if (/error|failed/i.test(saved)) {
 			throw new Error(`saving the environment failed: ${saved.trim()}`);
 		}
 	}
 }
+
+/**
+ * u-boot's complaints when `saveenv` can't resolve `mmc 0#env` — the partition
+ * isn't in the GPT, because the device is carrying an amlogic table instead.
+ */
+const NO_ENV_PARTITION = /bad device specification|could ?n['o]t find|no partition/i;
 
 /**
  * Rewrite a vendor burn-mode u-boot command for our u-boot, or return null if
