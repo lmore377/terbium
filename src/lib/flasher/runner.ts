@@ -23,6 +23,7 @@ import type { DataOrFile, FlashConfig, FlashStep, StringOrFile } from 'libsuperb
 import type { Bytes } from '$lib/bytes';
 import { Fastboot } from '$lib/fastboot/client';
 import {
+	BOOT_IMAGE_BYTES,
 	INFO_SECTOR_BYTES,
 	infoSector,
 	needsInfoSector,
@@ -247,15 +248,24 @@ const BOOTLOADER_PROBE_BYTES = INFO_SECTOR_BYTES;
  * black screen with the whole image reading back correct — the most expensive
  * mistake available on this path.
  *
- * Rather than require every published archive be rebuilt, we sniff for it. Only
- * a payload starting with the encrypted BL2 header counts as bare, so anything
- * already in on-disk form goes through untouched — including `unbrick.bin`,
- * which is a whole-disk image that opens with its own (zeroed) info sector.
+ * Rather than require every published archive be rebuilt, we sniff for it: a
+ * payload already carrying an info sector goes through untouched, anything else
+ * gets one.
+ *
+ * Sniffing alone is not enough, though. A whole-disk image such as `unbrick.bin`
+ * also starts at LBA 0, and its own first sector is high-entropy rather than an
+ * info sector — so it reads as bare too, and prepending 512 bytes would shift 64
+ * MiB of disk image by a sector and ruin it. The size bound is what separates
+ * the two: a bootloader never exceeds the boot hwpart size, a whole-disk image
+ * always does.
  */
 export async function withInfoSector(
 	source: StreamSource,
 	onLog?: (message: string) => void
 ): Promise<StreamSource> {
+	// too big to be a bootloader, so it is a whole-disk image and must not move
+	if (source.size > BOOT_IMAGE_BYTES) return source;
+
 	const reader = source.stream.getReader();
 	const pending: Uint8Array[] = [];
 	let probed = 0;
@@ -325,9 +335,10 @@ export async function runFlashConfig(
 
 			case 'writeUserArea': {
 				let source = await sourceFor(archive, step.value.data);
-				// A raw write at LBA 0 is a bootloader write, and burn-mode archives
-				// carry a bare dump because vendor u-boot built the info sector for
-				// them. Add it here if it's missing.
+				// A bootloader-sized raw write at LBA 0 is a bootloader write, and
+				// burn-mode archives carry a bare dump because vendor u-boot built the
+				// info sector for them. Add it here if it's missing; whole-disk images
+				// landing at LBA 0 are left alone.
 				if (step.value.lba === 0) source = await withInfoSector(source, onLog);
 				await flashRaw(fastboot, step.value.lba, source, {
 					sparse,
