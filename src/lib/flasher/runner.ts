@@ -24,20 +24,11 @@ import { Fastboot } from '$lib/fastboot/client';
 import type { FlashArchive } from './archive';
 import { ProgressTracker, StreamChunker, type FlashProgress, type StreamSource } from './types';
 
-/**
- * Which half of a chunk's round trip is running.
- *
- * Only `uploading` has a progress signal — fastboot reports nothing while the
- * device commits a chunk, so the UI needs to say what the stalled bar means.
- */
-export type StepPhase = 'uploading' | 'writing';
-
 export interface StepEvent {
 	stepIndex: number;
 	totalSteps: number;
 	label: string;
 	progress?: FlashProgress;
-	phase?: StepPhase;
 }
 
 export interface RunnerCallbacks {
@@ -70,6 +61,51 @@ const MAX_CHUNK_BYTES = 8 * 1024 * 1024;
 
 /** CONFIG_FASTBOOT_BUF_ADDR on our u-boot — where a download lands in DRAM. */
 const FASTBOOT_BUF_ADDR = 0x6000000;
+
+/**
+ * Share of a chunk's progress credited to the upload half of its round trip.
+ *
+ * A chunk is uploaded and then committed to eMMC, and only the upload reports
+ * bytes — `flash:` returns nothing until the write is done. Crediting the
+ * upload with the whole chunk would park the bar at the chunk boundary for the
+ * entire commit. Holding back half leaves room for `commitWithProgress` to keep
+ * it moving, and the two halves take roughly comparable time in practice.
+ */
+const UPLOAD_SHARE = 0.5;
+
+/** How often the bar advances while waiting on a commit. */
+const COMMIT_TICK_MS = 100;
+
+/** Fraction of the remaining gap closed per tick — asymptotic, so it never overshoots. */
+const COMMIT_EASE = 0.12;
+
+/**
+ * Run a blocking `flash:` while easing the progress bar across the share of the
+ * chunk that the upload didn't claim.
+ *
+ * The device gives no progress signal during a commit and we can't know ahead
+ * of time how long it takes, so the bar eases toward the chunk boundary
+ * asymptotically: a quick write ends after a couple of ticks, a slow one keeps
+ * crawling without ever reaching — and therefore never overstating — the end of
+ * the chunk. The real value lands the moment `flash:` returns.
+ */
+async function commitWithProgress(
+	tracker: ProgressTracker,
+	chunkBytes: number,
+	commit: () => Promise<void>,
+	onProgress?: (progress: FlashProgress) => void
+): Promise<void> {
+	let credited = chunkBytes * UPLOAD_SHARE;
+	const timer = setInterval(() => {
+		credited += (chunkBytes - credited) * COMMIT_EASE;
+		onProgress?.(tracker.snapshot(credited));
+	}, COMMIT_TICK_MS);
+	try {
+		await commit();
+	} finally {
+		clearInterval(timer);
+	}
+}
 
 /**
  * Stock amlogic user-area layout, in 512-byte sectors. `restorePartition`
@@ -188,8 +224,8 @@ export async function runFlashConfig(
 
 	for (const [stepIndex, step] of config.steps.entries()) {
 		signal?.throwIfAborted();
-		const emit = (progress?: FlashProgress, phase?: StepPhase) =>
-			onStep?.({ stepIndex, totalSteps, label: stepLabel(step), progress, phase });
+		const emit = (progress?: FlashProgress) =>
+			onStep?.({ stepIndex, totalSteps, label: stepLabel(step), progress });
 		emit();
 		const sparse = sparseFlag(step) || forceSparse === true;
 
@@ -217,10 +253,9 @@ export async function runFlashConfig(
 				const tracker = new ProgressTracker(bytes.byteLength);
 				await fastboot.download(bytes, {
 					signal,
-					onProgress: (sent) => emit(tracker.snapshot(sent), 'uploading')
+					onProgress: (sent) => emit(tracker.snapshot(sent * UPLOAD_SHARE))
 				});
-				emit(tracker.snapshot(bytes.byteLength), 'writing');
-				await fastboot.flash(target);
+				await commitWithProgress(tracker, bytes.byteLength, () => fastboot.flash(target), emit);
 				tracker.markWritten(bytes.byteLength);
 				emit(tracker.snapshot());
 				// Flashing a boot hwpart leaves it selected; anything touching the
@@ -317,7 +352,7 @@ export async function runFlashConfig(
 interface WriteOptions {
 	sparse?: boolean;
 	signal?: AbortSignal;
-	onProgress?: (progress: FlashProgress, phase?: StepPhase) => void;
+	onProgress?: (progress: FlashProgress) => void;
 }
 
 /**
@@ -362,12 +397,9 @@ async function flashRaw(
 			await fastboot.setRawTarget(RAW_ALIAS, lba, sectors);
 			await fastboot.download(padToSector(chunk), {
 				signal,
-				onProgress: (sent) => onProgress?.(tracker.snapshot(sent), 'uploading')
+				onProgress: (sent) => onProgress?.(tracker.snapshot(sent * UPLOAD_SHARE))
 			});
-			// The bar can't move while the device commits the chunk, so hold it at
-			// the end of what we uploaded and let the UI explain the pause.
-			onProgress?.(tracker.snapshot(length), 'writing');
-			await fastboot.flash(RAW_ALIAS);
+			await commitWithProgress(tracker, length, () => fastboot.flash(RAW_ALIAS), onProgress);
 			tracker.markWritten(length);
 			onProgress?.(tracker.snapshot());
 			lba += sectors;
@@ -405,10 +437,9 @@ async function flashByName(
 		const bytes = await chunker.read(source.size);
 		await fastboot.download(bytes, {
 			signal,
-			onProgress: (sent) => onProgress?.(tracker.snapshot(sent), 'uploading')
+			onProgress: (sent) => onProgress?.(tracker.snapshot(sent * UPLOAD_SHARE))
 		});
-		onProgress?.(tracker.snapshot(source.size), 'writing');
-		await fastboot.flash(name);
+		await commitWithProgress(tracker, source.size, () => fastboot.flash(name), onProgress);
 		tracker.markWritten(source.size);
 		onProgress?.(tracker.snapshot());
 	} finally {

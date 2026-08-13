@@ -4,7 +4,7 @@ import type { DiscoverManifest, Release } from './manifest';
 import { settings } from '$lib/settings.svelte';
 import { fetchRelease, fetchZip, type DownloadProgress } from './download';
 import { FlashArchive } from './archive';
-import { runFlashConfig, stepWeights, writeEnv, type StepEvent, type StepPhase } from './runner';
+import { runFlashConfig, stepWeights, writeEnv, type StepEvent } from './runner';
 import type { FlashProgress } from './types';
 import {
 	Fastboot,
@@ -75,7 +75,6 @@ export class Flasher {
 	totalSteps = $state(0);
 	stepLabel = $state('');
 	stepProgress = $state<FlashProgress | null>(null);
-	stepPhase = $state<StepPhase | null>(null);
 	overallPercent = $state(0);
 	flashedName = $state('');
 
@@ -246,7 +245,6 @@ export class Flasher {
 			this.totalSteps = archive.meta.steps.length;
 			this.stepIndex = 0;
 			this.stepProgress = null;
-		this.stepPhase = null;
 			this.overallPercent = 0;
 			this.log(`flashing ${archive.meta.name} ${archive.meta.version}`);
 
@@ -306,7 +304,6 @@ export class Flasher {
 		this.totalSteps = event.totalSteps;
 		this.stepLabel = event.label;
 		this.stepProgress = event.progress ?? null;
-		this.stepPhase = event.phase ?? null;
 
 		const totalWeight = this.weights.reduce((sum, weight) => sum + weight, 0);
 		const completedWeight = this.weights.slice(0, event.stepIndex).reduce((s, w) => s + w, 0);
@@ -377,7 +374,6 @@ export class Flasher {
 		this.interrupted = null;
 		this.downloadProgress = null;
 		this.stepProgress = null;
-		this.stepPhase = null;
 		this.overallPercent = 0;
 	}
 
@@ -387,7 +383,6 @@ export class Flasher {
 		this.selection = null;
 		this.downloadProgress = null;
 		this.stepProgress = null;
-		this.stepPhase = null;
 		this.stepIndex = 0;
 		this.totalSteps = 0;
 		this.stepLabel = '';
