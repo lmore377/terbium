@@ -18,15 +18,27 @@ import type { Bytes } from '$lib/bytes';
 export const INFO_SECTOR_BYTES = 512;
 
 /**
- * How much of a bootloader image lands on disk, matching the eMMC boot hwpart
- * size on a Car Thing.
+ * Largest a bootloader image is taken to be, and the cap on what `toBootImage`
+ * returns.
  *
- * Caveat: `BOOT_SIZE_MULT` is factory-set per eMMC chip and 2 MiB variants exist
- * in the wild, where a 4 MiB write is rejected with `MMC: block number 0x1001
- * exceeds max(0x1000)`. We don't detect that. Real content is around 1.3 MiB, so
- * the cap only ever discards trailing padding.
+ * This is the size of a stock `bootloader.dump`, so it is also the right bound
+ * for "is this payload a bootloader or a whole-disk image?" — which is what
+ * `withInfoSector` uses it for. It is *not* what gets written to a boot
+ * hwpart; see `BOOT_HWPART_BYTES`.
  */
 export const BOOT_IMAGE_BYTES = 4 * 1024 * 1024;
+
+/**
+ * How much of a boot image is written to an eMMC boot hwpart.
+ *
+ * `BOOT_SIZE_MULT` is factory-set per eMMC chip and Car Things exist with both
+ * 4 MiB and 2 MiB boot hwparts. A 4 MiB write to a 2 MiB part is rejected
+ * outright (`MMC: block number 0x1001 exceeds max(0x1000)`), so everything is
+ * sized for the smaller one. Nothing is lost: an info sector plus a real
+ * bootloader comes to about 1.3 MiB and the rest of a stock dump is zero
+ * padding. Content past this bound is an error rather than a silent truncation.
+ */
+export const BOOT_HWPART_BYTES = 2 * 1024 * 1024;
 
 /**
  * First bytes of the *stock* Car Thing BL2.

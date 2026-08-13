@@ -9,7 +9,7 @@
 //   writeUserArea       raw LBA write via a `fastboot_raw_partition_*` alias
 //   writeBootPartition  flash:mmc0boot0 / flash:mmc0boot1  (+ hwpart reset)
 //   restorePartition    the stock partition's LBA range, else a GPT name
-//   ├─ named bootloader info sector + image, to user-area LBA 0 *and* boot0
+//   ├─ named bootloader info sector + image, to user-area LBA 0 and both hwparts
 //   writeEnv            download + `env import -t` + `saveenv`
 //   bulkcmd             rewritten vendor command via `oem console`
 //   identify            getvar
@@ -23,6 +23,7 @@ import type { DataOrFile, FlashConfig, FlashStep, StringOrFile } from 'libsuperb
 import type { Bytes } from '$lib/bytes';
 import { Fastboot } from '$lib/fastboot/client';
 import {
+	BOOT_HWPART_BYTES,
 	BOOT_IMAGE_BYTES,
 	INFO_SECTOR_BYTES,
 	infoSector,
@@ -364,15 +365,18 @@ export async function runFlashConfig(
 				const name = step.value.name;
 
 				if (name === 'bootloader') {
-					// `bootloader` is not a partition write at all. Vendor u-boot turns
-					// `amlmmc write bootloader` into an info sector plus the image, laid
-					// down in *two* places: the user-area mirror at LBA 0, which is what
-					// the SoC boots from on a Car Thing, and boot0, which backs it up.
-					// Doing only the raw user-area write here would put every byte one
-					// sector early and leave the boot hwpart empty.
+					// Not a partition write: the image needs an info sector, and goes to
+					// the user-area mirror at LBA 0 and to both boot hwparts. A raw write
+					// here would land a sector early and leave the hwparts empty.
+					//
+					// Both hwparts, not just boot0: stock ships EXT_CSD PARTITION_CONFIG
+					// = 0x50, which points the mask ROM at boot1, so a device still
+					// carrying that value with an empty boot1 would rest the whole
+					// restore on the user-area mirror being reached first.
 					const image = toBootImage(await dataBytes(archive, step.value.data));
 					await flashRaw(fastboot, 0, inlineSource(image), { signal, onProgress: emit });
 					await writeBootHwpart(fastboot, 1, image, { signal, onProgress: emit });
+					await writeBootHwpart(fastboot, 2, image, { signal, onProgress: emit });
 					break;
 				}
 
@@ -490,13 +494,26 @@ async function writeBootHwpart(
 	}
 	const target = hwpart === 1 ? 'mmc0boot0' : 'mmc0boot1';
 
-	const tracker = new ProgressTracker(image.byteLength);
-	await fastboot.download(image, {
+	// Sized for the smaller of the two boot hwparts in the wild; the tail of a
+	// stock dump is zero padding. Real content past the bound would be silently
+	// lost, so refuse instead.
+	let payload = image;
+	if (payload.byteLength > BOOT_HWPART_BYTES) {
+		if (!isAllZero(payload.subarray(BOOT_HWPART_BYTES))) {
+			throw new Error(
+				`boot image carries content past ${BOOT_HWPART_BYTES} bytes and will not fit a 2 MiB boot hwpart`
+			);
+		}
+		payload = payload.subarray(0, BOOT_HWPART_BYTES);
+	}
+
+	const tracker = new ProgressTracker(payload.byteLength);
+	await fastboot.download(payload, {
 		signal,
 		onProgress: (sent) => onProgress?.(tracker.snapshot(sent * UPLOAD_SHARE))
 	});
-	await commitWithProgress(tracker, image.byteLength, () => fastboot.flash(target), onProgress);
-	tracker.markWritten(image.byteLength);
+	await commitWithProgress(tracker, payload.byteLength, () => fastboot.flash(target), onProgress);
+	tracker.markWritten(payload.byteLength);
 	onProgress?.(tracker.snapshot());
 
 	// Flashing a boot hwpart leaves it selected; anything touching the user area
