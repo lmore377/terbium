@@ -48,10 +48,9 @@
 				Reconnect to your device
 			</h2>
 			<p class="mt-3 max-w-[56ch] text-base/7 text-pretty text-muted-foreground sm:text-sm/6">
-				The device came back with a new identity, so your browser needs permission for it again. It
-				may be listed under a different name, like
-				<span class="whitespace-nowrap">"Android"</span> or
-				<span class="whitespace-nowrap">"Unknown device by Google Inc."</span>
+				The device came back with a new identity, so your browser needs permission for it again.
+				This time it's listed as
+				<span class="font-medium whitespace-nowrap text-foreground">Superbird</span>.
 			</p>
 		</div>
 		<div>
@@ -67,8 +66,8 @@
 			<p class="mt-3 max-w-[56ch] text-base/7 text-pretty text-muted-foreground sm:text-sm/6">
 				Your browser will ask which USB device to use. Pick
 				<span class="font-medium whitespace-nowrap text-foreground">GX-CHIP</span> — or
-				<span class="font-medium whitespace-nowrap text-foreground">Android</span> if your device is
-				already in fastboot — and hit connect.
+				<span class="font-medium whitespace-nowrap text-foreground">Superbird</span> if your device
+				is already in fastboot — and hit connect.
 			</p>
 		</div>
 
