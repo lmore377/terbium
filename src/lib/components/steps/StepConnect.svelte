@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { page } from '$app/state';
-	import type { ConnectStatus } from 'libsuperbird';
+	import type { ConnectStatus } from '$lib/flasher/state.svelte';
 	import CheckIcon from '@lucide/svelte/icons/check';
 	import { Button } from '$lib/components/ui/button';
 	import { Spinner } from '$lib/components/ui/spinner';
@@ -10,9 +10,8 @@
 
 	const STAGES: { key: ConnectStatus; label: string }[] = [
 		{ key: 'connecting', label: 'Opening the USB connection' },
-		{ key: 'bl2-boot', label: 'Sending the bootloader' },
-		{ key: 'resetting', label: 'Restarting into burn mode' },
-		{ key: 'waiting-reconnect', label: 'Reconnecting to the device' },
+		{ key: 'bootstrapping', label: 'Sending the bootloader' },
+		{ key: 'waiting-fastboot', label: 'Reconnecting to the device' },
 		{ key: 'connected', label: 'Connected' }
 	];
 
@@ -42,7 +41,7 @@
 	}
 </script>
 
-{#if flasher.phase === 'connecting' && flasher.connectStatus === 'waiting-reconnect'}
+{#if flasher.phase === 'connecting' && flasher.connectStatus === 'waiting-fastboot'}
 	<div class="flex flex-col gap-6">
 		<div>
 			<h2 class="max-w-[40ch] text-2xl font-semibold tracking-tight text-balance">
@@ -51,11 +50,12 @@
 			<p class="mt-3 max-w-[56ch] text-base/7 text-pretty text-muted-foreground sm:text-sm/6">
 				The device came back with a new identity, so your browser needs permission for it again. It
 				may be listed under a different name, like
-				<span class="whitespace-nowrap">"Unknown device by Amlogic, Inc."</span>
+				<span class="whitespace-nowrap">"Android"</span> or
+				<span class="whitespace-nowrap">"Unknown device by Google Inc."</span>
 			</p>
 		</div>
 		<div>
-			<Button onclick={() => flasher.requestBurnDevice()}>Select device</Button>
+			<Button onclick={() => flasher.requestFastbootDevice()}>Select device</Button>
 		</div>
 	</div>
 {:else}
@@ -65,8 +65,10 @@
 				Connect to your device
 			</h2>
 			<p class="mt-3 max-w-[56ch] text-base/7 text-pretty text-muted-foreground sm:text-sm/6">
-				Your browser will ask which USB device to use. Pick the one called
-				<span class="font-medium whitespace-nowrap text-foreground">GX-CHIP</span> and hit connect.
+				Your browser will ask which USB device to use. Pick
+				<span class="font-medium whitespace-nowrap text-foreground">GX-CHIP</span> — or
+				<span class="font-medium whitespace-nowrap text-foreground">Android</span> if your device is
+				already in fastboot — and hit connect.
 			</p>
 		</div>
 
