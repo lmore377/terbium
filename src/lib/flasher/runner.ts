@@ -9,6 +9,7 @@
 //   writeUserArea       raw LBA write via a `fastboot_raw_partition_*` alias
 //   writeBootPartition  flash:mmc0boot0 / flash:mmc0boot1  (+ hwpart reset)
 //   restorePartition    the stock partition's LBA range, else a GPT name
+//   ├─ named bootloader info sector + image, to user-area LBA 0 *and* boot0
 //   writeEnv            download + `env import -t` + `saveenv`
 //   bulkcmd             rewritten vendor command via `oem console`
 //   identify            getvar
@@ -21,6 +22,7 @@
 import type { DataOrFile, FlashConfig, FlashStep, StringOrFile } from 'libsuperbird/meta';
 import type { Bytes } from '$lib/bytes';
 import { Fastboot } from '$lib/fastboot/client';
+import { toBootImage } from '$lib/fastboot/boot-image';
 import type { FlashArchive } from './archive';
 import { ProgressTracker, StreamChunker, type FlashProgress, type StreamSource } from './types';
 
@@ -39,6 +41,13 @@ export interface RunnerCallbacks {
 }
 
 const SECTOR_BYTES = 512;
+
+/**
+ * eMMC erase-group size in sectors — 4 MiB, from HC_ERASE_GRP_SIZE 0x08 with
+ * ERASE_GROUP_DEF set on the superbird's eMMC. A sparse write can only erase
+ * whole groups; a partial one at either end would take neighbouring data with it.
+ */
+const ERASE_GROUP_SECTORS = 8 * 1024;
 
 /**
  * Alias used for raw-LBA writes. Kept to two characters on purpose: the whole
@@ -197,19 +206,21 @@ async function textValue(archive: FlashArchive, value: StringOrFile): Promise<st
 	return archive.textOf(value.filePath);
 }
 
+/** Present an in-memory buffer as a StreamSource, so it can go through `flashRaw`. */
+function inlineSource(bytes: Bytes): StreamSource {
+	return {
+		size: bytes.byteLength,
+		stream: new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(bytes);
+				controller.close();
+			}
+		})
+	};
+}
+
 async function sourceFor(archive: FlashArchive, data: DataOrFile): Promise<StreamSource> {
-	if (Array.isArray(data)) {
-		const bytes = new Uint8Array(data);
-		return {
-			size: bytes.byteLength,
-			stream: new ReadableStream<Uint8Array>({
-				start(controller) {
-					controller.enqueue(bytes);
-					controller.close();
-				}
-			})
-		};
-	}
+	if (Array.isArray(data)) return inlineSource(new Uint8Array(data));
 	return archive.sourceOf(data.filePath);
 }
 
@@ -242,30 +253,38 @@ export async function runFlashConfig(
 				await flashRaw(fastboot, step.value.lba, await sourceFor(archive, step.value.data), {
 					sparse,
 					signal,
-					onProgress: emit
+					onProgress: emit,
+					onLog
 				});
 				break;
 
 			case 'writeBootPartition': {
-				// mmc0boot0 / mmc0boot1 are u-boot's names for the eMMC boot hwparts.
-				const target = step.value.hwpart === 1 ? 'mmc0boot0' : 'mmc0boot1';
-				const bytes = await dataBytes(archive, step.value.data);
-				const tracker = new ProgressTracker(bytes.byteLength);
-				await fastboot.download(bytes, {
+				const data = await dataBytes(archive, step.value.data);
+				// A bare bootloader dump gets its info sector here; an image that
+				// already has one is written as-is.
+				await writeBootHwpart(fastboot, step.value.hwpart, toBootImage(data), {
 					signal,
-					onProgress: (sent) => emit(tracker.snapshot(sent * UPLOAD_SHARE))
+					onProgress: emit
 				});
-				await commitWithProgress(tracker, bytes.byteLength, () => fastboot.flash(target), emit);
-				tracker.markWritten(bytes.byteLength);
-				emit(tracker.snapshot());
-				// Flashing a boot hwpart leaves it selected; anything touching the
-				// user area next would land in the wrong place.
-				await fastboot.selectHwpart(0);
 				break;
 			}
 
 			case 'restorePartition': {
 				const name = step.value.name;
+
+				if (name === 'bootloader') {
+					// `bootloader` is not a partition write at all. Vendor u-boot turns
+					// `amlmmc write bootloader` into an info sector plus the image, laid
+					// down in *two* places: the user-area mirror at LBA 0, which is what
+					// the SoC boots from on a Car Thing, and boot0, which backs it up.
+					// Doing only the raw user-area write here would put every byte one
+					// sector early and leave the boot hwpart empty.
+					const image = toBootImage(await dataBytes(archive, step.value.data));
+					await flashRaw(fastboot, 0, inlineSource(image), { signal, onProgress: emit });
+					await writeBootHwpart(fastboot, 1, image, { signal, onProgress: emit });
+					break;
+				}
+
 				const source = await sourceFor(archive, step.value.data);
 				const stock = STOCK_PARTITIONS[name];
 				if (stock) {
@@ -275,7 +294,12 @@ export async function runFlashConfig(
 							`${name} image is ${source.size} bytes but the partition only holds ${limit}`
 						);
 					}
-					await flashRaw(fastboot, stock.offset, source, { sparse, signal, onProgress: emit });
+					await flashRaw(fastboot, stock.offset, source, {
+						sparse,
+						signal,
+						onProgress: emit,
+						onLog
+					});
 				} else {
 					// Not a stock partition — assume the device's GPT names it.
 					onLog?.(`${name} is not a stock partition, flashing it by GPT name`);
@@ -353,15 +377,56 @@ interface WriteOptions {
 	sparse?: boolean;
 	signal?: AbortSignal;
 	onProgress?: (progress: FlashProgress) => void;
+	onLog?: (message: string) => void;
+}
+
+/**
+ * Write an already-prepared boot image to an eMMC boot hwpart, then put the
+ * hwpart selection back.
+ *
+ * The image must already be in on-disk form — see `$lib/fastboot/boot-image`.
+ */
+async function writeBootHwpart(
+	fastboot: Fastboot,
+	hwpart: number,
+	image: Bytes,
+	options: WriteOptions = {}
+): Promise<void> {
+	const { signal, onProgress } = options;
+	// mmc0boot0 / mmc0boot1 are u-boot's names for the eMMC boot hwparts.
+	if (hwpart !== 1 && hwpart !== 2) {
+		throw new Error(`boot hwpart must be 1 or 2, got ${hwpart}`);
+	}
+	const target = hwpart === 1 ? 'mmc0boot0' : 'mmc0boot1';
+
+	const tracker = new ProgressTracker(image.byteLength);
+	await fastboot.download(image, {
+		signal,
+		onProgress: (sent) => onProgress?.(tracker.snapshot(sent * UPLOAD_SHARE))
+	});
+	await commitWithProgress(tracker, image.byteLength, () => fastboot.flash(target), onProgress);
+	tracker.markWritten(image.byteLength);
+	onProgress?.(tracker.snapshot());
+
+	// Flashing a boot hwpart leaves it selected; anything touching the user area
+	// next would land in the wrong place.
+	await fastboot.selectHwpart(0);
 }
 
 /**
  * Write a stream to a raw LBA range, one download-buffer-sized chunk at a time.
  *
  * Each chunk points the throwaway `tb` alias at its own sector range and then
- * flashes it, so u-boot handles the actual block writes. With `sparse` set,
- * all-zero chunks are skipped entirely — that's what makes a 64 MiB unbrick
- * image or a mostly-empty rootfs finish in a fraction of the time.
+ * flashes it, so u-boot handles the actual block writes.
+ *
+ * `sparse` means what it means on the amlogic path: the whole-erase-group span
+ * of the target range is erased up front, and chunks that are entirely zero and
+ * land inside that span are then skipped rather than written, since the erase
+ * has already put them where the image wants them. That's what makes a 64 MiB
+ * unbrick image or a mostly-empty rootfs finish in a fraction of the time
+ * *without* leaving stale bytes behind. If the erase fails the skipping is
+ * abandoned and every chunk is written, so a zero in the image is never
+ * silently a no-op.
  */
 async function flashRaw(
 	fastboot: Fastboot,
@@ -369,10 +434,38 @@ async function flashRaw(
 	source: StreamSource,
 	options: WriteOptions = {}
 ): Promise<void> {
-	const { sparse, signal, onProgress } = options;
+	const { sparse, signal, onProgress, onLog } = options;
 	const limit = await fastboot.maxDownloadSize();
 	const chunkBytes =
 		Math.max(1, Math.floor(Math.min(limit, MAX_CHUNK_BYTES) / SECTOR_BYTES)) * SECTOR_BYTES;
+
+	// Only the whole erase groups strictly inside the range can be erased; a
+	// partial group at either end would take neighbouring data with it. Byte
+	// offsets, relative to the start of the payload.
+	let erasedFrom = 0;
+	let erasedTo = 0;
+	if (sparse) {
+		const spanSectors = Math.ceil(source.size / SECTOR_BYTES);
+		const eraseStart = Math.ceil(startLba / ERASE_GROUP_SECTORS) * ERASE_GROUP_SECTORS;
+		const eraseEnd =
+			Math.floor((startLba + spanSectors) / ERASE_GROUP_SECTORS) * ERASE_GROUP_SECTORS;
+
+		if (eraseEnd > eraseStart) {
+			try {
+				await fastboot.setRawTarget(RAW_ALIAS, eraseStart, eraseEnd - eraseStart);
+				await fastboot.erase(RAW_ALIAS);
+				erasedFrom = (eraseStart - startLba) * SECTOR_BYTES;
+				erasedTo = (eraseEnd - startLba) * SECTOR_BYTES;
+			} catch (error) {
+				// Better to spend the bandwidth than to leave the caller's zeroes unwritten.
+				onLog?.(
+					`erase failed (${describe(error)}); writing every chunk instead of skipping zeroes`
+				);
+			}
+		} else {
+			onLog?.(`sparse write at sector ${startLba} spans no whole erase group; writing it in full`);
+		}
+	}
 
 	const chunker = new StreamChunker(source.stream);
 	const tracker = new ProgressTracker(source.size);
@@ -384,10 +477,13 @@ async function flashRaw(
 			signal?.throwIfAborted();
 			const length = Math.min(chunkBytes, source.size - offset);
 			const chunk = await chunker.read(length);
+			const chunkStart = offset;
 			offset += length;
 			const sectors = Math.ceil(length / SECTOR_BYTES);
 
-			if (sparse && isAllZero(chunk)) {
+			// Only skippable where the up-front erase has already laid the zeroes down.
+			const erased = chunkStart >= erasedFrom && chunkStart + length <= erasedTo;
+			if (erased && isAllZero(chunk)) {
 				tracker.markSkipped(length);
 				onProgress?.(tracker.snapshot());
 				lba += sectors;
@@ -523,6 +619,10 @@ function padToSector(data: Bytes): Bytes {
 	const padded = new Uint8Array(data.byteLength + (SECTOR_BYTES - remainder));
 	padded.set(data);
 	return padded;
+}
+
+function describe(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
 
 function sleep(ms: number): Promise<void> {

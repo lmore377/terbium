@@ -1,0 +1,91 @@
+// The on-disk form of the amlogic bootloader.
+//
+// A stock `bootloader.dump` is a bare bootloader image: signed BL2 first, then
+// the FIP. That is *not* what the SoC expects to find on eMMC. Both places a
+// bootloader lives — the eMMC boot hwparts and the user-area mirror at LBA 0 —
+// hold a 512-byte info sector first, so that BL2 itself begins at LBA 1. The
+// mask ROM reads BL2 from LBA 1, not LBA 0.
+//
+// Vendor u-boot builds that info sector itself, which is why `amlmmc write
+// bootloader` can be handed a bare dump. Nothing outside vendor u-boot does, so
+// anything writing a bootloader over fastboot (or any other raw path) has to
+// prepend it — a bare dump written at offset 0 puts every byte one sector early
+// and simply will not boot, while reading back byte-perfect.
+
+import type { Bytes } from '$lib/bytes';
+
+/** Size of the info sector, and therefore the offset the bootloader image itself sits at. */
+export const INFO_SECTOR_BYTES = 512;
+
+/**
+ * How much of a bootloader image lands on disk, matching the eMMC boot hwpart
+ * size on a Car Thing.
+ *
+ * Caveat: `BOOT_SIZE_MULT` is factory-set per eMMC chip and 2 MiB variants exist
+ * in the wild, where a 4 MiB write is rejected with `MMC: block number 0x1001
+ * exceeds max(0x1000)`. We don't detect that. Real content is around 1.3 MiB, so
+ * the cap only ever discards trailing padding.
+ */
+export const BOOT_IMAGE_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Leading bytes shared by every signed amlogic bootloader image we handle — the
+ * encrypted BL2 header. A stock `bootloader.dump`, `superbird.bootloader.img`
+ * and `superbird.bl2.encrypted.bin` all begin with these, which is what makes it
+ * a usable "is this a bare image?" test.
+ */
+const BL2_SIGNATURE = [0x0c, 0x62, 0x7a, 0x15, 0xbe, 0x94, 0x07, 0xb2];
+
+/**
+ * Build the info sector for a Car Thing.
+ *
+ * This is amlogic's `storage_emmc_boot_info`. BL2 never reads it — its only job
+ * is to occupy LBA 0 as a spacer, and an all-zero sector boots just as well —
+ * but a well-formed one is free and keeps the image byte-compatible with vendor
+ * tooling. The values are the ones read off a Car Thing that boots.
+ */
+export function infoSector(): Uint8Array {
+	const sector = new Uint8Array(INFO_SECTOR_BYTES);
+	const view = new DataView(sector.buffer);
+
+	view.setUint32(0x000, 1, true); // version
+	view.setUint32(0x004, 0x12000, true); // rsv_base_addr, in sectors: the reserved region at 36 MiB
+	view.setUint32(0x008, 0, true); // dtb.addr — vendor leaves these zero
+	view.setUint32(0x00c, 0, true); // dtb.size
+	view.setUint32(0x010, 0x4000, true); // ddr.addr, in sectors, relative to the reserved region
+	view.setUint32(0x014, 4, true); // ddr.size, in sectors
+
+	// The checksum is a wrapping sum of every u32 ahead of it, and lives in the last one.
+	let checksum = 0;
+	for (let offset = 0; offset < INFO_SECTOR_BYTES - 4; offset += 4) {
+		checksum = (checksum + view.getUint32(offset, true)) >>> 0;
+	}
+	view.setUint32(INFO_SECTOR_BYTES - 4, checksum, true);
+
+	return sector;
+}
+
+/** Whether `data` is a bare bootloader image that still needs an info sector in front of it. */
+export function needsInfoSector(data: Bytes): boolean {
+	if (data.byteLength < BL2_SIGNATURE.length) return false;
+	return BL2_SIGNATURE.every((byte, index) => data[index] === byte);
+}
+
+/**
+ * Put a bootloader image into the form the SoC expects to find on eMMC.
+ *
+ * A bare image gets an info sector prepended; one that already has it is passed
+ * through untouched, so callers can hand this either a stock `bootloader.dump`
+ * or a pre-built boot-partition image without having to know which.
+ */
+export function toBootImage(data: Bytes): Bytes {
+	if (!needsInfoSector(data)) {
+		return data.subarray(0, Math.min(data.byteLength, BOOT_IMAGE_BYTES)).slice();
+	}
+
+	const length = Math.min(data.byteLength + INFO_SECTOR_BYTES, BOOT_IMAGE_BYTES);
+	const image = new Uint8Array(length);
+	image.set(infoSector());
+	image.set(data.subarray(0, length - INFO_SECTOR_BYTES), INFO_SECTOR_BYTES);
+	return image;
+}
