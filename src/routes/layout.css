@@ -1,7 +1,24 @@
 @import 'tailwindcss';
 @import 'tw-animate-css';
 @import 'shadcn-svelte/tailwind.css';
-@import '@fontsource-variable/inter';
+
+/* Comic Sans everywhere, deliberately, so a test build is never mistaken for
+ * the real terbium. Comic Sans MS ships on Windows and macOS but not Linux,
+ * so Comic Neue (OFL) is bundled as the guaranteed fallback. */
+@font-face {
+	font-family: 'Comic Neue';
+	font-style: normal;
+	font-weight: 400;
+	font-display: swap;
+	src: url('/fonts/comic-neue-latin-400-normal.woff2') format('woff2');
+}
+@font-face {
+	font-family: 'Comic Neue';
+	font-style: normal;
+	font-weight: 700;
+	font-display: swap;
+	src: url('/fonts/comic-neue-latin-700-normal.woff2') format('woff2');
+}
 
 @custom-variant dark (&:is(.dark *));
 @plugin '@tailwindcss/forms';
@@ -31,8 +48,8 @@
 }
 
 @theme inline {
-	--font-sans: 'Inter Variable', sans-serif;
-	--font-sans--font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11', 'ss01', 'ss03';
+	--font-sans: 'Comic Sans MS', 'Comic Neue', cursive;
+	--font-mono: 'Comic Sans MS', 'Comic Neue', cursive;
 	--color-ring: var(--ring);
 	--color-input: var(--input);
 	--color-border: var(--border);

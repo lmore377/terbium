@@ -1,85 +1,65 @@
 <script lang="ts">
 	import CarThing from '$lib/carthing/CarThing.svelte';
-	import type { ScreenRect } from '$lib/carthing/carthing-engine';
+	import type { FlashTarget, PartId, ScreenPoint, ScreenRect } from '$lib/carthing/carthing-engine';
+	import { DeviceUi } from '$lib/carthing/device-ui';
 	import { flasher } from '$lib/flasher/state.svelte';
 	import { wizard } from '$lib/wizard/wizard.svelte';
 	import { formatBytes } from '$lib/format';
 
 	const ACCENT = '#34d399';
-	const SPOTIFY_GREEN = '#1ed760';
 	const SCREEN_BG = '#080a09';
 	const SCREEN_TEXT = '#e9fef6';
 	const SCREEN_MUTED = 'rgba(233, 254, 246, 0.55)';
 	const SCREEN_TRACK = 'rgba(255, 255, 255, 0.12)';
 
+	/** The toy UI only owns the screen on steps that are not reporting progress;
+	 * everywhere else the flasher needs the panel for status. */
+	const PLAYABLE_STEPS = ['welcome', 'done'];
+	/** Repainting the LCD means re-uploading a 918x492 texture, so cap it well
+	 * below the render loop's rate. */
+	const UI_FPS = 30;
+
 	let ct = $state<CarThing>();
 	let ready = $state(false);
 	let lastScreenDraw = 0;
+
+	const ui = new DeviceUi();
+	const playable = $derived(PLAYABLE_STEPS.includes(wizard.step));
+
+	function paintUi(): void {
+		ct?.setScreenDraw((ctx, lcd) => ui.draw(ctx, lcd));
+	}
+
+	/** Every part except the inert surfaces has an LED the engine can pulse. */
+	function flashable(part: PartId): part is FlashTarget {
+		return part !== 'screen' && part !== 'body' && part !== 'hump';
+	}
+
+	function onTap(part: PartId): void {
+		if (!playable) return;
+		if (ui.key(part)) {
+			paintUi();
+			if (part !== 'dial' && flashable(part)) {
+				ct?.flash(part, ACCENT, { flashes: 1, duration: 260 });
+			}
+		}
+	}
+
+	function onDial(detents: number): void {
+		if (!playable) return;
+		ui.dial(detents);
+		paintUi();
+	}
+
+	function onScreenTap(p: ScreenPoint): void {
+		if (!playable) return;
+		if (ui.tap(p)) paintUi();
+	}
 
 	function drawBlack(): void {
 		ct?.setScreenDraw((ctx, lcd) => {
 			ctx.fillStyle = '#000';
 			ctx.fillRect(lcd.x, lcd.y, lcd.w, lcd.h);
-		});
-	}
-
-	function drawHome(): void {
-		ct?.setScreenDraw((ctx, lcd) => {
-			const s = lcd.w / 800;
-			const font = (size: number, weight = 700) =>
-				`${weight} ${Math.round(size * s)}px 'Inter Variable', sans-serif`;
-
-			ctx.fillStyle = '#000';
-			ctx.fillRect(lcd.x, lcd.y, lcd.w, lcd.h);
-			ctx.textAlign = 'left';
-			ctx.textBaseline = 'alphabetic';
-
-			const headerX = lcd.x + 44 * s;
-			const headerBaseline = lcd.y + 60 * s;
-			ctx.font = font(32);
-			ctx.fillStyle = '#fff';
-			ctx.fillText('Music', headerX, headerBaseline);
-			const musicWidth = ctx.measureText('Music').width;
-			ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
-			ctx.fillText('Podcasts', headerX + musicWidth + 48 * s, headerBaseline);
-			const podcastsWidth = ctx.measureText('Podcasts').width;
-			ctx.fillText('Your Library', headerX + musicWidth + podcastsWidth + 96 * s, headerBaseline);
-			ctx.fillStyle = SPOTIFY_GREEN;
-			ctx.fillRect(headerX, headerBaseline + 8 * s, musicWidth, 4 * s);
-
-			const tile = 240 * s;
-			const gap = 32 * s;
-			const tileY = lcd.y + 112 * s;
-			const tiles = [
-				{ label: 'Discover Weekly', fill: '#3b4d5c' },
-				{ label: 'Release Radar', fill: '#4d3b58' },
-				{ label: 'Daily Mix 1', fill: '#39503f' }
-			];
-			tiles.forEach((entry, index) => {
-				const tileX = lcd.x + 50 * s + index * (tile + gap);
-				const active = index === 0;
-				ctx.globalAlpha = active ? 1 : 0.8;
-				ctx.fillStyle = entry.fill;
-				ctx.fillRect(tileX, tileY, tile, tile);
-				ctx.fillStyle = 'rgba(255, 255, 255, 0.14)';
-				ctx.beginPath();
-				ctx.arc(tileX + tile / 2, tileY + tile / 2, tile * 0.22, 0, Math.PI * 2);
-				ctx.fill();
-				if (active) {
-					ctx.strokeStyle = '#fff';
-					ctx.lineWidth = 4 * s;
-					ctx.beginPath();
-					ctx.roundRect(tileX - 8 * s, tileY - 8 * s, tile + 16 * s, tile + 16 * s, 8 * s);
-					ctx.stroke();
-				}
-				ctx.font = font(32);
-				ctx.fillStyle = active ? '#fff' : 'rgba(255, 255, 255, 0.7)';
-				ctx.fillText(entry.label, tileX, tileY + tile + 56 * s, tile);
-				ctx.globalAlpha = 1;
-			});
-			ctx.font = font(28, 400);
-			ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
-			ctx.fillText('Playlist', lcd.x + 50 * s, tileY + tile + 92 * s);
 		});
 	}
 
@@ -92,18 +72,18 @@
 
 			if (percent !== null) {
 				ctx.fillStyle = SCREEN_TEXT;
-				ctx.font = `600 ${Math.round(lcd.h * 0.3)}px 'Inter Variable', sans-serif`;
+				ctx.font = `600 ${Math.round(lcd.h * 0.3)}px 'Comic Sans MS', 'Comic Neue', cursive`;
 				ctx.textBaseline = 'alphabetic';
 				ctx.fillText(`${Math.floor(percent)}%`, centerX, lcd.y + lcd.h * 0.44);
 			} else {
 				ctx.fillStyle = ACCENT;
-				ctx.font = `600 ${Math.round(lcd.h * 0.16)}px 'Inter Variable', sans-serif`;
+				ctx.font = `600 ${Math.round(lcd.h * 0.16)}px 'Comic Sans MS', 'Comic Neue', cursive`;
 				ctx.textBaseline = 'middle';
 				ctx.fillText('terbium', centerX, lcd.y + lcd.h * 0.38);
 			}
 
 			ctx.fillStyle = SCREEN_MUTED;
-			ctx.font = `500 ${Math.round(lcd.h * 0.085)}px 'Inter Variable', sans-serif`;
+			ctx.font = `500 ${Math.round(lcd.h * 0.085)}px 'Comic Sans MS', 'Comic Neue', cursive`;
 			ctx.textBaseline = 'middle';
 			ctx.fillText(title, centerX, lcd.y + lcd.h * 0.58);
 			if (subtitle) {
@@ -141,7 +121,7 @@
 
 		if (step === 'welcome') {
 			model.panTo('front');
-			drawHome();
+			paintUi();
 		} else if (step === 'prepare') {
 			model.panTo('keys');
 			model.flash('preset1', ACCENT, { infinite: true, duration: 1300 });
@@ -164,7 +144,7 @@
 		} else if (step === 'done') {
 			model.panTo('front');
 			model.flash('dial', ACCENT, { flashes: 3 });
-			drawHome();
+			paintUi();
 		}
 
 		return () => {
@@ -175,6 +155,24 @@
 				model.stopFlash('usb');
 			}
 		};
+	});
+
+	$effect(() => {
+		if (!playable || !ready || !ct) return;
+		let raf = 0;
+		let last = performance.now();
+		let lastPaint = 0;
+		const loop = (t: number) => {
+			raf = requestAnimationFrame(loop);
+			const dt = Math.min((t - last) / 1000, 0.1);
+			last = t;
+			if (ui.tick(dt) && t - lastPaint > 1000 / UI_FPS) {
+				lastPaint = t;
+				paintUi();
+			}
+		};
+		raf = requestAnimationFrame(loop);
+		return () => cancelAnimationFrame(raf);
 	});
 
 	$effect(() => {
@@ -213,4 +211,11 @@
 	});
 </script>
 
-<CarThing bind:this={ct} defaultUi={false} onready={() => (ready = true)} />
+<CarThing
+	bind:this={ct}
+	defaultUi={false}
+	onready={() => (ready = true)}
+	ontap={onTap}
+	ondial={onDial}
+	onscreentap={onScreenTap}
+/>

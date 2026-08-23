@@ -2,10 +2,13 @@
 	import {
 		CarThingEngine,
 		type Color,
+		type EngineHandlers,
 		type FlashOptions,
 		type FlashTarget,
 		type PanOptions,
+		type PartId,
 		type ScreenDrawFn,
+		type ScreenPoint,
 		type ScreenRect,
 		type SpinOptions,
 		type ViewName,
@@ -16,9 +19,23 @@
 		interactive?: boolean;
 		defaultUi?: boolean;
 		onready?: (engine: CarThingEngine) => void;
+		onpress?: (part: PartId) => void;
+		ontap?: (part: PartId) => void;
+		onhover?: (part: PartId | null) => void;
+		onscreentap?: (p: ScreenPoint) => void;
+		ondial?: (detents: number) => void;
 	}
 
-	let { interactive = true, defaultUi = true, onready }: Props = $props();
+	let {
+		interactive = true,
+		defaultUi = true,
+		onready,
+		onpress,
+		ontap,
+		onhover,
+		onscreentap,
+		ondial
+	}: Props = $props();
 	let canvas: HTMLCanvasElement;
 	let engine: CarThingEngine | undefined;
 
@@ -56,6 +73,9 @@
 	export function setDefaultUi(on: boolean): void {
 		engine?.setDefaultUi(on);
 	}
+	export function press(part: PartId, holdMs?: number): void {
+		engine?.press(part, holdMs);
+	}
 	export function getEngine(): CarThingEngine | undefined {
 		return engine;
 	}
@@ -69,6 +89,13 @@
 		}
 		onready?.(engine);
 		return () => engine?.destroy();
+	});
+
+	// Kept out of the construction effect so swapping a handler does not tear
+	// down the GL context and rebuild every mesh.
+	$effect(() => {
+		const h: EngineHandlers = { onpress, ontap, onhover, onscreentap, ondial };
+		if (engine) engine.handlers = h;
 	});
 </script>
 

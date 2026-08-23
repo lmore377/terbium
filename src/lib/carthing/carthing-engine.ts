@@ -1,7 +1,18 @@
 export type FlashTarget =
 	'preset1' | 'preset2' | 'preset3' | 'preset4' | 'settings' | 'back' | 'usb' | 'dial' | 'tag';
 
+/** Anything the pointer can land on. `body` and `hump` are hit-tested purely so
+ * they occlude the parts behind them; they are not interactive. */
+export type PartId = FlashTarget | 'screen' | 'body' | 'hump';
+
 export type ViewName = 'front' | 'screen' | 'back' | 'keys' | 'dial' | 'usb';
+
+/** Point on the emulated LCD, in the coordinate space of the UI canvas that
+ * `setScreenDraw` paints into (so it shares an origin with `ScreenRect`). */
+export interface ScreenPoint {
+	x: number;
+	y: number;
+}
 
 export type RGB = [number, number, number];
 export type Color = string | RGB;
@@ -39,7 +50,87 @@ export interface ScreenRect {
 export interface EngineOptions {
 	interactive?: boolean;
 	defaultUi?: boolean;
+	/** Hit-test the pointer against the model and drive press/hover state.
+	 * Costs one extra offscreen pass per pointer move. Defaults to `interactive`. */
+	pickable?: boolean;
 }
+
+export interface EngineHandlers {
+	/** Fires on pointer-down over a pressable part, before any drag disambiguation. */
+	onpress?: (part: PartId) => void;
+	/** A press that was released without turning into a camera drag. */
+	ontap?: (part: PartId) => void;
+	onhover?: (part: PartId | null) => void;
+	/** Tap on the LCD, in UI-canvas coordinates. */
+	onscreentap?: (p: ScreenPoint) => void;
+	/** Dial rotation. `detents` is the accumulated whole-click count since the
+	 * last callback, sign-carrying; the real dial is a rotary encoder. */
+	ondial?: (detents: number) => void;
+}
+
+/** How far each pressable part travels when pushed, in model units (mm). */
+const PRESS_TRAVEL: Partial<Record<PartId, number>> = {
+	preset1: 0.9,
+	preset2: 0.9,
+	preset3: 0.9,
+	preset4: 0.9,
+	settings: 0.9,
+	back: 0.7,
+	dial: 0.6
+};
+
+const PRESS_DOWN_MS = 70;
+const PRESS_UP_MS = 130;
+/** Radians of dial rotation per encoder detent. */
+const DIAL_DETENT = Math.PI / 12;
+/** Pointer travel that converts a press into a camera drag. */
+const DRAG_SLOP = 6;
+
+/** Parts small enough on screen to deserve a forgiving hit radius. Seen from
+ * the default front view the keys are nearly edge-on -- a literal one-pixel
+ * test makes them a ~4px tall target. */
+const SLOPPY = new Set<PartId>([
+	'preset1',
+	'preset2',
+	'preset3',
+	'preset4',
+	'settings',
+	'back',
+	'tag',
+	'usb'
+]);
+/** Pick slop in framebuffer pixels. */
+const PICK_SLOP = 5;
+
+/** Parts that light up and switch the cursor under the pointer. */
+const HOVERABLE = new Set<PartId>([
+	'preset1',
+	'preset2',
+	'preset3',
+	'preset4',
+	'settings',
+	'back',
+	'dial',
+	'screen',
+	'usb',
+	'tag'
+]);
+
+/** Pick-pass id byte per part. 0 is reserved for "nothing". */
+const PICK_IDS: PartId[] = [
+	'body',
+	'hump',
+	'screen',
+	'preset1',
+	'preset2',
+	'preset3',
+	'preset4',
+	'settings',
+	'back',
+	'dial',
+	'usb',
+	'tag'
+];
 
 export type ScreenDrawFn = (ctx: CanvasRenderingContext2D, lcd: ScreenRect) => void;
 
@@ -147,6 +238,20 @@ varying vec2 vUV;
 uniform sampler2D uTex;
 void main() {
   gl_FragColor = texture2D(uTex, vUV);
+}`;
+
+const PICK_VS = `
+attribute vec3 aPos;
+uniform mat4 uMVP;
+void main() {
+  gl_Position = uMVP * vec4(aPos, 1.0);
+}`;
+
+const PICK_FS = `
+precision mediump float;
+uniform float uId;
+void main() {
+  gl_FragColor = vec4(uId, 0.0, 0.0, 1.0);
 }`;
 
 function mat4Identity(): Float32Array {
@@ -504,6 +609,29 @@ interface TexLocations {
 	uTex: WebGLUniformLocation | null;
 }
 
+interface PickLocations {
+	aPos: number;
+	uMVP: WebGLUniformLocation | null;
+	uId: WebGLUniformLocation | null;
+}
+
+interface PressState {
+	t0: number;
+	releasedAt: number | null;
+}
+
+/** Rotate a vector about X. Matches mat4RotX's handedness. */
+function rotXv(v: number[], a: number): number[] {
+	const c = Math.cos(a),
+		s = Math.sin(a);
+	return [v[0], c * v[1] - s * v[2], s * v[1] + c * v[2]];
+}
+function rotYv(v: number[], a: number): number[] {
+	const c = Math.cos(a),
+		s = Math.sin(a);
+	return [c * v[0] + s * v[2], v[1], -s * v[0] + c * v[2]];
+}
+
 export class CarThingEngine {
 	yaw: number;
 	pitch: number;
@@ -548,6 +676,25 @@ export class CarThingEngine {
 	private _lastUiUpdate = 0;
 	private _raf: number;
 
+	/** Pointer interaction. */
+	handlers: EngineHandlers = {};
+	private _pickable: boolean;
+	private _pickProg: WebGLProgram | null = null;
+	private _pickLoc: PickLocations | null = null;
+	private _pickFbo: WebGLFramebuffer | null = null;
+	private _pickTex: WebGLTexture | null = null;
+	private _pickDepth: WebGLRenderbuffer | null = null;
+	private _pickW = 0;
+	private _pickH = 0;
+	private _press = new Map<PartId, PressState>();
+	private _held: PartId | null = null;
+	private _hover: PartId | null = null;
+	/** Dial drag: accumulates raw radians so detents can be emitted as crossed.
+	 * `turned` is unsigned travel, used to tell a twist from a click. */
+	private _dialDrag: { angle: number; emitted: number; turned: number } | null = null;
+	private _dialDetents = 0;
+	private _pickCache: { x: number; y: number; t: number; part: PartId | null } | null = null;
+
 	constructor(canvas: HTMLCanvasElement, opts: EngineOptions = {}) {
 		const interactive = opts.interactive !== false;
 		const gl = canvas.getContext('webgl', { antialias: true, alpha: true });
@@ -586,6 +733,16 @@ export class CarThingEngine {
 			uMVP: gl.getUniformLocation(this._texProg, 'uMVP'),
 			uTex: gl.getUniformLocation(this._texProg, 'uTex')
 		};
+
+		this._pickable = opts.pickable ?? interactive;
+		if (this._pickable) {
+			this._pickProg = program(PICK_VS, PICK_FS);
+			this._pickLoc = {
+				aPos: gl.getAttribLocation(this._pickProg, 'aPos'),
+				uMVP: gl.getUniformLocation(this._pickProg, 'uMVP'),
+				uId: gl.getUniformLocation(this._pickProg, 'uId')
+			};
+		}
 
 		const uploadMesh = (pos: number[], nrm: Float32Array): Mesh => {
 			const posBuf = gl.createBuffer()!;
@@ -742,7 +899,9 @@ export class CarThingEngine {
 
 		if (interactive) {
 			let lastX = 0,
-				lastY = 0;
+				lastY = 0,
+				downX = 0,
+				downY = 0;
 			const on = <K extends keyof HTMLElementEventMap>(
 				el: HTMLElement,
 				ev: K,
@@ -753,28 +912,105 @@ export class CarThingEngine {
 				this._listeners.push([el, ev, fn as EventListener]);
 			};
 			on(canvas, 'pointerdown', (e) => {
-				this._dragging = true;
 				this._camTween = null;
-				lastX = e.clientX;
-				lastY = e.clientY;
-				canvas.setPointerCapture(e.pointerId);
+				lastX = downX = e.clientX;
+				lastY = downY = e.clientY;
+				try {
+					canvas.setPointerCapture(e.pointerId);
+				} catch {
+					// Capture is a nicety for drags that leave the canvas; never let
+					// it stop the press itself from registering.
+				}
+
+				const hit = this._pick(e.clientX, e.clientY);
+				// The dial takes the drag outright -- twisting it is the point, and
+				// there is no sensible "orbit from the dial" gesture to preserve.
+				if (hit === 'dial') {
+					this._beginPress('dial');
+					this._dialDrag = {
+						angle: this._pointerDialAngle(e.clientX, e.clientY) ?? 0,
+						emitted: 0,
+						turned: 0
+					};
+					return;
+				}
+				if (hit && PRESS_TRAVEL[hit] !== undefined) {
+					this._beginPress(hit);
+					return;
+				}
+				// Screen and dead areas stay grabbable: a tap fires on release, but
+				// moving past the slop threshold converts it into a camera orbit.
+				this._held = hit;
+				this._dragging = false;
 			});
 			on(canvas, 'pointermove', (e) => {
-				if (!this._dragging) return;
-				const dx = e.clientX - lastX,
-					dy = e.clientY - lastY;
+				if (this._dialDrag) {
+					const a = this._pointerDialAngle(e.clientX, e.clientY);
+					if (a !== null) {
+						let d = a - this._dialDrag.angle;
+						while (d > Math.PI) d -= Math.PI * 2;
+						while (d < -Math.PI) d += Math.PI * 2;
+						this._dialDrag.angle = a;
+						this._dialDrag.turned += Math.abs(d);
+						this._dialAngle += d;
+						this._spin = null;
+						this._emitDetents(d);
+					}
+					return;
+				}
+
+				const movedFar = Math.hypot(e.clientX - downX, e.clientY - downY) > DRAG_SLOP;
+				if (e.buttons && !this._dragging && movedFar) {
+					// Promote to an orbit and abandon whatever was being pressed.
+					this._dragging = true;
+					if (this._held) this._endPress(this._held);
+					this._held = null;
+				}
+
+				if (this._dragging) {
+					const dx = e.clientX - lastX,
+						dy = e.clientY - lastY;
+					this.yaw += dx * 0.008;
+					this.pitch = Math.max(-1.35, Math.min(1.35, this.pitch + dy * 0.008));
+					this._velYaw = dx * 0.008;
+					this._velPitch = dy * 0.008;
+				} else if (!e.buttons) {
+					this._setHover(this._pick(e.clientX, e.clientY));
+				}
 				lastX = e.clientX;
 				lastY = e.clientY;
-				this.yaw += dx * 0.008;
-				this.pitch = Math.max(-1.35, Math.min(1.35, this.pitch + dy * 0.008));
-				this._velYaw = dx * 0.008;
-				this._velPitch = dy * 0.008;
 			});
-			on(canvas, 'pointerup', () => {
+			on(canvas, 'pointerup', (e) => {
+				const held = this._held;
+				const dial = this._dialDrag;
+				this._dialDrag = null;
 				this._dragging = false;
+				this._held = null;
+				if (dial) {
+					this._endPress('dial');
+					// A twist is not a click. Straight-line distance is the wrong test
+					// for a rotary control -- a full turn lands back on its start
+					// point -- so gate on how far the dial actually rotated.
+					if (dial.turned < DIAL_DETENT / 2) this.handlers.ontap?.('dial');
+					return;
+				}
+				if (!held) return;
+				this._endPress(held);
+				if (Math.hypot(e.clientX - downX, e.clientY - downY) > DRAG_SLOP) return;
+				this.handlers.ontap?.(held);
+				if (held === 'screen') {
+					const p = this._screenPoint(e.clientX, e.clientY);
+					if (p) this.handlers.onscreentap?.(p);
+				}
 			});
 			on(canvas, 'pointercancel', () => {
+				if (this._held) this._endPress(this._held);
+				this._held = null;
+				this._dialDrag = null;
 				this._dragging = false;
+			});
+			on(canvas, 'pointerleave', () => {
+				this._setHover(null);
 			});
 			on(
 				canvas,
@@ -782,6 +1018,15 @@ export class CarThingEngine {
 				(e) => {
 					e.preventDefault();
 					this._camTween = null;
+					// Over the dial the wheel turns the dial instead of dollying --
+					// it is the one control a scroll gesture maps onto naturally.
+					if (this._pick(e.clientX, e.clientY) === 'dial') {
+						const d = -e.deltaY * 0.0025;
+						this._dialAngle += d;
+						this._spin = null;
+						this._emitDetents(d);
+						return;
+					}
 					this.dist = Math.max(120, Math.min(500, this.dist + e.deltaY * 0.35));
 				},
 				{ passive: false }
@@ -911,8 +1156,225 @@ export class CarThingEngine {
 		this._destroyed = true;
 		cancelAnimationFrame(this._raf);
 		for (const [el, ev, fn] of this._listeners) el.removeEventListener(ev, fn);
+		if (this._pickFbo) {
+			this._gl.deleteFramebuffer(this._pickFbo);
+			this._gl.deleteTexture(this._pickTex);
+			this._gl.deleteRenderbuffer(this._pickDepth);
+			this._pickFbo = null;
+		}
 		const ext = this._gl.getExtension('WEBGL_lose_context');
 		if (ext) ext.loseContext();
+	}
+
+	/** Drive a press animation from code, e.g. to echo a physical button. */
+	press(part: PartId, holdMs = 110): void {
+		if (PRESS_TRAVEL[part] === undefined) return;
+		this._beginPress(part);
+		setTimeout(() => this._endPress(part), holdMs);
+	}
+
+	get hovered(): PartId | null {
+		return this._hover;
+	}
+
+	private _beginPress(part: PartId): void {
+		this._held = part;
+		this._dragging = false;
+		this._press.set(part, { t0: performance.now(), releasedAt: null });
+		this.handlers.onpress?.(part);
+	}
+
+	private _endPress(part: PartId): void {
+		const p = this._press.get(part);
+		if (p && p.releasedAt === null) p.releasedAt = performance.now();
+	}
+
+	private _pressAmt(part: PartId, now: number): number {
+		const p = this._press.get(part);
+		if (!p) return 0;
+		if (p.releasedAt === null) return Math.min(1, (now - p.t0) / PRESS_DOWN_MS);
+		const peak = Math.min(1, (p.releasedAt - p.t0) / PRESS_DOWN_MS);
+		const u = (now - p.releasedAt) / PRESS_UP_MS;
+		if (u >= 1) {
+			this._press.delete(part);
+			return 0;
+		}
+		return peak * (1 - easeInOut(u));
+	}
+
+	private _setHover(part: PartId | null): void {
+		const real = part && HOVERABLE.has(part) ? part : null;
+		if (real === this._hover) return;
+		this._hover = real;
+		this._canvas.style.cursor = real ? 'pointer' : '';
+		this.handlers.onhover?.(real);
+	}
+
+	private _emitDetents(deltaRadians: number): void {
+		if (!this._dialDrag) {
+			this._dialDetents += deltaRadians;
+		} else {
+			this._dialDrag.emitted += deltaRadians;
+			this._dialDetents = this._dialDrag.emitted;
+		}
+		const whole = Math.trunc(this._dialDetents / DIAL_DETENT);
+		if (!whole) return;
+		this._dialDetents -= whole * DIAL_DETENT;
+		if (this._dialDrag) this._dialDrag.emitted -= whole * DIAL_DETENT;
+		this.handlers.ondial?.(whole);
+	}
+
+	/** Ray through the pointer, in model space. The view transform is a pure
+	 * rotate-then-translate, so it inverts without a general matrix inverse. */
+	private _rayModel(clientX: number, clientY: number): { o: number[]; d: number[] } | null {
+		const r = this._canvas.getBoundingClientRect();
+		if (!r.width || !r.height) return null;
+		const ndcX = ((clientX - r.left) / r.width) * 2 - 1;
+		const ndcY = 1 - ((clientY - r.top) / r.height) * 2;
+		const tanF = Math.tan(0.5 / 2);
+		const dView = [ndcX * tanF * (r.width / r.height), ndcY * tanF, -1];
+		const untilt = (v: number[]) => rotYv(rotXv(v, -this.pitch), -this.yaw);
+		return { o: untilt([0, 0, this.dist]), d: untilt(dView) };
+	}
+
+	/** Where the pointer ray crosses a model-space plane of constant z. */
+	private _planeHit(clientX: number, clientY: number, z: number): number[] | null {
+		const ray = this._rayModel(clientX, clientY);
+		if (!ray || Math.abs(ray.d[2]) < 1e-6) return null;
+		const t = (z - ray.o[2]) / ray.d[2];
+		if (t <= 0) return null;
+		return [ray.o[0] + ray.d[0] * t, ray.o[1] + ray.d[1] * t, z];
+	}
+
+	private _screenPoint(clientX: number, clientY: number): ScreenPoint | null {
+		const p = this._planeHit(clientX, clientY, GLASS_Z);
+		if (!p) return null;
+		const u = p[0] / GLASS_W + 0.5;
+		const v = p[1] / GLASS_H + 0.5;
+		if (u < 0 || u > 1 || v < 0 || v > 1) return null;
+		// The texture is uploaded flipped, so v runs bottom-up against the canvas.
+		return { x: u * UI_W, y: (1 - v) * UI_H };
+	}
+
+	private _pointerDialAngle(clientX: number, clientY: number): number | null {
+		const p = this._planeHit(clientX, clientY, BODY_D / 2 + DIAL_D - 1);
+		if (!p) return null;
+		return Math.atan2(p[1] - DIAL_Y, p[0] - DIAL_X);
+	}
+
+	private _ensurePickTargets(): boolean {
+		const gl = this._gl;
+		const w = this._canvas.width,
+			h = this._canvas.height;
+		if (!w || !h) return false;
+		if (this._pickFbo && this._pickW === w && this._pickH === h) return true;
+		if (this._pickFbo) {
+			gl.deleteFramebuffer(this._pickFbo);
+			gl.deleteTexture(this._pickTex);
+			gl.deleteRenderbuffer(this._pickDepth);
+		}
+		this._pickTex = gl.createTexture();
+		gl.bindTexture(gl.TEXTURE_2D, this._pickTex);
+		gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+		gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+		gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+		gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+		gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+		this._pickDepth = gl.createRenderbuffer();
+		gl.bindRenderbuffer(gl.RENDERBUFFER, this._pickDepth);
+		gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, w, h);
+		this._pickFbo = gl.createFramebuffer();
+		gl.bindFramebuffer(gl.FRAMEBUFFER, this._pickFbo);
+		gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this._pickTex, 0);
+		gl.framebufferRenderbuffer(
+			gl.FRAMEBUFFER,
+			gl.DEPTH_ATTACHMENT,
+			gl.RENDERBUFFER,
+			this._pickDepth
+		);
+		const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+		gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+		if (!ok) {
+			this._pickFbo = null;
+			return false;
+		}
+		this._pickW = w;
+		this._pickH = h;
+		return true;
+	}
+
+	/** Which part is under the pointer, by rendering ids to an offscreen buffer.
+	 * Exact about occlusion, unlike testing analytic bounds part by part. */
+	private _pick(clientX: number, clientY: number): PartId | null {
+		if (!this._pickable || !this._pickProg) return null;
+		const now = performance.now();
+		if (
+			this._pickCache &&
+			now - this._pickCache.t < 16 &&
+			Math.hypot(clientX - this._pickCache.x, clientY - this._pickCache.y) < 2
+		) {
+			return this._pickCache.part;
+		}
+		if (!this._ensurePickTargets()) return null;
+		const gl = this._gl;
+		const r = this._canvas.getBoundingClientRect();
+		if (!r.width || !r.height) return null;
+		const px = Math.round(((clientX - r.left) / r.width) * this._pickW);
+		const py = Math.round((1 - (clientY - r.top) / r.height) * this._pickH);
+		if (px < 0 || py < 0 || px >= this._pickW || py >= this._pickH) return null;
+
+		gl.bindFramebuffer(gl.FRAMEBUFFER, this._pickFbo);
+		gl.viewport(0, 0, this._pickW, this._pickH);
+		gl.clearColor(0, 0, 0, 0);
+		gl.enable(gl.DEPTH_TEST);
+		gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+		const m = this._matrices();
+		this._renderScene(m.base, m.baseNrm, m.rot, true);
+
+		// Read a block rather than a texel: an exact hit wins outright, but if the
+		// pointer merely grazes a small control, that control still gets the click.
+		const slop = Math.max(1, Math.round((PICK_SLOP * this._pickW) / r.width));
+		const x0 = Math.max(0, px - slop);
+		const y0 = Math.max(0, py - slop);
+		const bw = Math.min(this._pickW, px + slop + 1) - x0;
+		const bh = Math.min(this._pickH, py + slop + 1) - y0;
+		const block = new Uint8Array(bw * bh * 4);
+		gl.readPixels(x0, y0, bw, bh, gl.RGBA, gl.UNSIGNED_BYTE, block);
+		gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+		const at = (bx: number, by: number): PartId | null => {
+			const idx = block[(by * bw + bx) * 4] - 1;
+			return idx >= 0 && idx < PICK_IDS.length ? PICK_IDS[idx] : null;
+		};
+		const cx = px - x0,
+			cy = py - y0;
+		let part = at(cx, cy);
+		if (!part || !SLOPPY.has(part)) {
+			let best: PartId | null = null;
+			let bestD = Infinity;
+			for (let by = 0; by < bh; by++) {
+				for (let bx = 0; bx < bw; bx++) {
+					const p = at(bx, by);
+					if (!p || !SLOPPY.has(p)) continue;
+					const d = (bx - cx) * (bx - cx) + (by - cy) * (by - cy);
+					if (d < bestD) {
+						bestD = d;
+						best = p;
+					}
+				}
+			}
+			if (best) part = best;
+		}
+		this._pickCache = { x: clientX, y: clientY, t: now, part };
+		return part;
+	}
+
+	private _matrices(): { base: Float32Array; baseNrm: Float32Array; rot: Float32Array } {
+		const aspect = this._canvas.width / this._canvas.height;
+		const proj = mat4Perspective(0.5, aspect, 10, 1200);
+		const view = mat4Translate(0, 0, -this.dist);
+		const rot = mat4Mul(mat4RotX(this.pitch), mat4RotY(this.yaw));
+		return { base: mat4Mul(proj, mat4Mul(view, rot)), baseNrm: mat3FromMat4(rot), rot };
 	}
 
 	private _flashColor(target: FlashTarget, base: RGB): RGB {
@@ -1095,39 +1557,70 @@ export class CarThingEngine {
 		gl.enable(gl.DEPTH_TEST);
 		gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-		const aspect = this._canvas.width / this._canvas.height;
-		const proj = mat4Perspective(0.5, aspect, 10, 1200);
-		const view = mat4Translate(0, 0, -this.dist);
-		const rot = mat4Mul(mat4RotX(this.pitch), mat4RotY(this.yaw));
-		const base = mat4Mul(proj, mat4Mul(view, rot));
-		const baseNrm = mat3FromMat4(rot);
-		const C = this._baseColors;
+		const m = this._matrices();
+		this._renderScene(m.base, m.baseNrm, m.rot, false, spinning);
+	}
 
-		this._drawLit(this._body, C.body, 0.35, base, baseNrm);
-		this._drawLit(this._hump, C.hump, 0.3, base, baseNrm);
-		this._drawLit(this._slot, this._flashColor('usb', C.slot), 0.4, base, baseNrm);
-		this._drawLit(this._edgeTab, this._flashColor('tag', C.tab), 0.3, base, baseNrm);
-		const keyNames: FlashTarget[] = ['preset1', 'preset2', 'preset3', 'preset4', 'settings'];
+	/** One geometry path for both passes, so what the pointer hits is exactly
+	 * what is on screen -- press offsets included. */
+	private _renderScene(
+		base: Float32Array,
+		baseNrm: Float32Array,
+		rot: Float32Array,
+		pick: boolean,
+		spinning = false
+	): void {
+		const gl = this._gl;
+		const C = this._baseColors;
+		const now = performance.now();
+		const sink = (part: PartId) => (PRESS_TRAVEL[part] ?? 0) * this._pressAmt(part, now);
+		const draw = (
+			mesh: Mesh,
+			part: PartId,
+			color: RGB,
+			gloss: number,
+			mvp: Float32Array,
+			nrm: Float32Array
+		) => {
+			if (pick) this._drawPick(mesh, part, mvp);
+			else this._drawLit(mesh, this._shade(part, color), gloss, mvp, nrm);
+		};
+
+		draw(this._body, 'body', C.body, 0.35, base, baseNrm);
+		draw(this._hump, 'hump', C.hump, 0.3, base, baseNrm);
+		draw(this._slot, 'usb', C.slot, 0.4, base, baseNrm);
+		draw(this._edgeTab, 'tag', C.tab, 0.3, base, baseNrm);
+
+		const keyNames: PartId[] = ['preset1', 'preset2', 'preset3', 'preset4', 'settings'];
 		for (let i = 0; i < this._keys.length; i++) {
-			this._drawLit(this._keys[i], this._flashColor(keyNames[i], C.key), 0.3, base, baseNrm);
+			const part = keyNames[i];
+			// Keys were built lying along +Y, so they depress downward in world Y.
+			const mvp = mat4Mul(base, mat4Translate(0, -sink(part), 0));
+			draw(this._keys[i], part, C.key, 0.3, mvp, baseNrm);
 		}
-		for (const m of this._mics) this._drawLit(m, C.mic, 0.1, base, baseNrm);
+		for (const mic of this._mics) draw(mic, 'body', C.mic, 0.1, base, baseNrm);
 
 		const dialLocal = mat4Mul(
-			mat4Translate(DIAL_X, DIAL_Y, BODY_D / 2 + DIAL_D / 2 - 1),
+			mat4Translate(DIAL_X, DIAL_Y, BODY_D / 2 + DIAL_D / 2 - 1 - sink('dial')),
 			mat4RotZ(this._dialAngle)
 		);
 		const dialMVP = mat4Mul(base, dialLocal);
 		const dialNrm = mat3FromMat4(mat4Mul(rot, mat4RotZ(this._dialAngle)));
-		this._drawLit(this._dial, this._flashColor('dial', C.dial), 0.12, dialMVP, dialNrm);
-		if (spinning) {
+		draw(this._dial, 'dial', C.dial, 0.12, dialMVP, dialNrm);
+		// The index dot tracks the dial whenever it is turning by any means, so a
+		// hand-twist reads as rotation and not just a spinning highlight.
+		if (spinning || this._dialDrag || this._dialAngle % (Math.PI * 2) !== 0) {
 			const dotMVP = mat4Mul(dialMVP, mat4Translate(0, DIAL_R - 4.5, DIAL_D / 2 + 0.1));
-			this._drawLit(this._dialDot, [0.16, 0.165, 0.17], 0.2, dotMVP, dialNrm);
+			draw(this._dialDot, 'dial', [0.16, 0.165, 0.17], 0.2, dotMVP, dialNrm);
 		}
 
-		const backMVP = mat4Mul(base, mat4Translate(46, -17.5, BODY_D / 2 - 0.55));
-		this._drawLit(this._backBtn, this._flashColor('back', C.back), 0.12, backMVP, baseNrm);
+		const backMVP = mat4Mul(base, mat4Translate(46, -17.5, BODY_D / 2 - 0.55 - sink('back')));
+		draw(this._backBtn, 'back', C.back, 0.12, backMVP, baseNrm);
 
+		if (pick) {
+			this._drawPickRaw(this._screenPosBuf, this._screenVerts, 'screen', base);
+			return;
+		}
 		gl.useProgram(this._texProg);
 		gl.bindBuffer(gl.ARRAY_BUFFER, this._screenPosBuf);
 		gl.enableVertexAttribArray(this._texLoc.aPos);
@@ -1140,6 +1633,35 @@ export class CarThingEngine {
 		gl.bindTexture(gl.TEXTURE_2D, this._tex);
 		gl.uniform1i(this._texLoc.uTex, 0);
 		gl.drawArrays(gl.TRIANGLES, 0, this._screenVerts);
+	}
+
+	/** Hover lift on top of whatever the flash animation is doing. */
+	private _shade(part: PartId, base: RGB): RGB {
+		let c = base;
+		if (this._hover === part && HOVERABLE.has(part)) {
+			c = [Math.min(1, base[0] + 0.06), Math.min(1, base[1] + 0.07), Math.min(1, base[2] + 0.065)];
+		}
+		return part === 'body' || part === 'hump' || part === 'screen'
+			? c
+			: this._flashColor(part as FlashTarget, c);
+	}
+
+	private _drawPick(mesh: Mesh, part: PartId, mvp: Float32Array): void {
+		this._drawPickRaw(mesh.posBuf, mesh.count, part, mvp);
+	}
+
+	private _drawPickRaw(posBuf: WebGLBuffer, count: number, part: PartId, mvp: Float32Array): void {
+		const gl = this._gl;
+		const loc = this._pickLoc;
+		if (!this._pickProg || !loc) return;
+		const id = PICK_IDS.indexOf(part) + 1;
+		gl.useProgram(this._pickProg);
+		gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+		gl.enableVertexAttribArray(loc.aPos);
+		gl.vertexAttribPointer(loc.aPos, 3, gl.FLOAT, false, 0, 0);
+		gl.uniformMatrix4fv(loc.uMVP, false, mvp);
+		gl.uniform1f(loc.uId, id / 255);
+		gl.drawArrays(gl.TRIANGLES, 0, count);
 	}
 
 	private _drawLit(
