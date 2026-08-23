@@ -1,7 +1,7 @@
 // Translation layer: v2 flash archives → fastboot.
 //
 // Flash archives are written against the amlogic vendor burn-mode protocol
-// (bulkcmd, writeUserArea, restorePartition, …). Terbium no longer speaks it —
+// (bulkcmd, writeUserArea, restorePartition, …). Terbium no longer speaks it;
 // the device runs our mainline u-boot and answers fastboot. Rather than break
 // every published archive, each v2 step is translated into the equivalent
 // fastboot operation here. The mapping:
@@ -13,7 +13,7 @@
 //   writeEnv            download + `env import -t` + `saveenv`
 //   bulkcmd             rewritten vendor command via `oem console`
 //   identify            getvar
-//   bl2Boot & friends   dropped — the bootstrap happens at connect time
+//   bl2Boot & friends   dropped, the bootstrap happens at connect time
 //
 // Raw writes deliberately go through `flash:` rather than `mmc write`: u-boot
 // then does its own bounds checking and sparse-image handling, and we get one
@@ -50,7 +50,7 @@ export interface RunnerCallbacks {
 const SECTOR_BYTES = 512;
 
 /**
- * eMMC erase-group size in sectors — 4 MiB, from HC_ERASE_GRP_SIZE 0x08 with
+ * eMMC erase-group size in sectors: 4 MiB, from HC_ERASE_GRP_SIZE 0x08 with
  * ERASE_GROUP_DEF set on the superbird's eMMC. A sparse write can only erase
  * whole groups; a partial one at either end would take neighbouring data with it.
  */
@@ -67,7 +67,7 @@ const RAW_ALIAS = 'tb';
  * Host-side chunk ceiling.
  *
  * The device would accept 112 MiB (CONFIG_FASTBOOT_BUF_SIZE), but a chunk is a
- * strictly serialized round trip — upload, then a blocking `flash:` while the
+ * strictly serialized round trip: upload, then a blocking `flash:` while the
  * eMMC commits it, with no progress reported for the second half. At 32 MiB
  * that write is a 3-5 second dead stop; at 8 MiB it's under a second, which
  * reads as continuous. The extra `setenv`+`flash` round trips cost microseconds
@@ -75,14 +75,14 @@ const RAW_ALIAS = 'tb';
  */
 const MAX_CHUNK_BYTES = 8 * 1024 * 1024;
 
-/** CONFIG_FASTBOOT_BUF_ADDR on our u-boot — where a download lands in DRAM. */
+/** CONFIG_FASTBOOT_BUF_ADDR on our u-boot, where a download lands in DRAM. */
 const FASTBOOT_BUF_ADDR = 0x6000000;
 
 /**
  * Share of a chunk's progress credited to the upload half of its round trip.
  *
  * A chunk is uploaded and then committed to eMMC, and only the upload reports
- * bytes — `flash:` returns nothing until the write is done. Crediting the
+ * bytes; `flash:` returns nothing until the write is done. Crediting the
  * upload with the whole chunk would park the bar at the chunk boundary for the
  * entire commit. Holding back half leaves room for `commitWithProgress` to keep
  * it moving, and the two halves take roughly comparable time in practice.
@@ -92,7 +92,7 @@ const UPLOAD_SHARE = 0.5;
 /** How often the bar advances while waiting on a commit. */
 const COMMIT_TICK_MS = 100;
 
-/** Fraction of the remaining gap closed per tick — asymptotic, so it never overshoots. */
+/** Fraction of the remaining gap closed per tick, asymptotic so it never overshoots. */
 const COMMIT_EASE = 0.12;
 
 /**
@@ -102,7 +102,7 @@ const COMMIT_EASE = 0.12;
  * The device gives no progress signal during a commit and we can't know ahead
  * of time how long it takes, so the bar eases toward the chunk boundary
  * asymptotically: a quick write ends after a couple of ticks, a slow one keeps
- * crawling without ever reaching — and therefore never overstating — the end of
+ * crawling without ever reaching (and therefore never overstating) the end of
  * the chunk. The real value lands the moment `flash:` returns.
  */
 async function commitWithProgress(
@@ -233,7 +233,7 @@ async function sourceFor(archive: FlashArchive, data: DataOrFile): Promise<Strea
 
 /**
  * Leading bytes we need in hand to tell a bare bootloader image from a prepared
- * one — a whole sector, since the test is "does an info sector start here?".
+ * one, a whole sector, since the test is "does an info sector start here?".
  */
 const BOOTLOADER_PROBE_BYTES = INFO_SECTOR_BYTES;
 
@@ -241,12 +241,12 @@ const BOOTLOADER_PROBE_BYTES = INFO_SECTOR_BYTES;
  * Give a bootloader image its info sector on the way to LBA 0, if it hasn't got
  * one already.
  *
- * A raw write at LBA 0 is a bootloader write — that's where the mask ROM looks,
+ * A raw write at LBA 0 is a bootloader write: that's where the mask ROM looks,
  * and it expects a 512-byte info sector first, with BL2 itself starting at LBA
  * 1. Vendor u-boot builds that sector as part of `amlmmc write bootloader`, so
  * archives written against burn mode carry a *bare* dump and never mention it.
  * Written raw here every byte lands one sector early, and the device sits at a
- * black screen with the whole image reading back correct — the most expensive
+ * black screen with the whole image reading back correct, the most expensive
  * mistake available on this path.
  *
  * Rather than require every published archive be rebuilt, we sniff for it: a
@@ -255,7 +255,7 @@ const BOOTLOADER_PROBE_BYTES = INFO_SECTOR_BYTES;
  *
  * Sniffing alone is not enough, though. A whole-disk image such as `unbrick.bin`
  * also starts at LBA 0, and its own first sector is high-entropy rather than an
- * info sector — so it reads as bare too, and prepending 512 bytes would shift 64
+ * info sector, so it reads as bare too, and prepending 512 bytes would shift 64
  * MiB of disk image by a sector and ruin it. The size bound is what separates
  * the two: a bootloader never exceeds the boot hwpart size, a whole-disk image
  * always does.
@@ -396,7 +396,7 @@ export async function runFlashConfig(
 						onLog
 					});
 				} else {
-					// Not a stock partition — assume the device's GPT names it.
+					// Not a stock partition, assume the device's GPT names it.
 					onLog?.(`${name} is not a stock partition, flashing it by GPT name`);
 					await flashByName(fastboot, name, source, { signal, onProgress: emit });
 				}
@@ -447,7 +447,7 @@ export async function runFlashConfig(
 			}
 
 			// Mask-ROM-only steps. An archive carrying these is describing its own
-			// bootstrap, which terbium now performs at connect time instead — by
+			// bootstrap, which terbium now performs at connect time instead; by
 			// the time we get here the device is already running our u-boot.
 			case 'bl2Boot':
 			case 'run':
@@ -479,7 +479,7 @@ interface WriteOptions {
  * Write an already-prepared boot image to an eMMC boot hwpart, then put the
  * hwpart selection back.
  *
- * The image must already be in on-disk form — see `$lib/fastboot/boot-image`.
+ * The image must already be in on-disk form, see `$lib/fastboot/boot-image`.
  */
 async function writeBootHwpart(
 	fastboot: Fastboot,
@@ -618,8 +618,8 @@ async function flashRaw(
 
 /**
  * Flash a partition the device resolves itself (a GPT name). Unlike a raw
- * write we can't split this across chunks — u-boot restarts at the partition
- * start for every `flash:` — so the image has to fit the download buffer.
+ * write we can't split this across chunks (u-boot restarts at the partition
+ * start for every `flash:`), so the image has to fit the download buffer.
  */
 async function flashByName(
 	fastboot: Fastboot,
@@ -661,7 +661,7 @@ async function flashByName(
  *
  * That lookup goes through the GPT, and mainline u-boot cannot read the amlogic
  * partition table. An archive restoring a vendor layout therefore leaves no
- * `env` partition we can see and `saveenv` has nowhere to go — which is an
+ * `env` partition we can see and `saveenv` has nowhere to go, which is an
  * expected outcome of that restore rather than a failed flash, so it's reported
  * and stepped over. The import itself still applied, and a vendor-layout device
  * reads its environment from the `env` partition the archive restored anyway.
@@ -688,7 +688,7 @@ export async function writeEnv(
 		const saved = await fastboot.console('saveenv');
 		if (NO_ENV_PARTITION.test(saved)) {
 			options.onLog?.(
-				'there is no env partition this bootloader can see, so the environment was not saved — ' +
+				'there is no env partition this bootloader can see, so the environment was not saved; ' +
 					'expected when the image being restored uses the amlogic partition table'
 			);
 		} else if (/error|failed/i.test(saved)) {
@@ -698,7 +698,7 @@ export async function writeEnv(
 }
 
 /**
- * u-boot's complaints when `saveenv` can't resolve `mmc 0#env` — the partition
+ * u-boot's complaints when `saveenv` can't resolve `mmc 0#env`: the partition
  * isn't in the GPT, because the device is carrying an amlogic table instead.
  */
 const NO_ENV_PARTITION = /bad device specification|could ?n['o]t find|no partition/i;
@@ -711,7 +711,7 @@ const NO_ENV_PARTITION = /bad device specification|could ?n['o]t find|no partiti
  * the eMMC as `mmc dev 1`; ours is `mmc dev 0`. The `amlmmc` command is the
  * vendor's fork of `mmc` and its partition/key subcommands operate on an
  * amlogic partition table that our layout doesn't have. Anything unrecognised
- * is passed through — u-boot will say so if it doesn't know the command.
+ * is passed through, u-boot will say so if it doesn't know the command.
  */
 export function translateVendorCommand(command: string): string | null {
 	const trimmed = command.trim();

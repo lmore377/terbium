@@ -6,7 +6,7 @@
 
 	const detected = detectPlatform();
 
-	// macOS has no tab of its own — it needs nothing — so park it on Windows.
+	// macOS has no tab of its own (it needs nothing), so park it on Windows.
 	let selected = $state<DriverPlatform>(detected === 'linux' ? 'linux' : 'windows');
 
 	const setup = $derived(driverSetup(selected) ?? DRIVER_SETUPS[0]);
@@ -56,7 +56,7 @@
 
 	{#if selected === 'windows'}
 		<p class="text-base/7 text-pretty text-muted-foreground sm:text-sm/6">
-			Windows will ask for admin once — it installs drivers for both USB modes the device uses.
+			Windows will ask for admin once; it installs drivers for both USB modes the device uses.
 		</p>
 	{/if}
 </div>

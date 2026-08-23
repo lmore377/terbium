@@ -79,7 +79,7 @@ export class Fastboot {
 		if (!device.opened) await device.open();
 		if (device.configuration === null) await device.selectConfiguration(1);
 
-		// Match on class/subclass/protocol rather than taking interface 0 — our
+		// Match on class/subclass/protocol rather than taking interface 0: our
 		// u-boot only exposes fastboot, but a device also offering adb would
 		// otherwise be a coin flip.
 		for (const iface of device.configuration!.interfaces) {
@@ -195,7 +195,7 @@ export class Fastboot {
 	/**
 	 * Upload a buffer into the device's scratch buffer (CONFIG_FASTBOOT_BUF_ADDR,
 	 * 0x6000000 on our u-boot). The data stays there until the next download, so
-	 * a following `flash:` — or an `oem console` reading that address — sees it.
+	 * a following `flash:` (or an `oem console` reading that address) sees it.
 	 */
 	async download(
 		data: Bytes,
@@ -245,7 +245,7 @@ export class Fastboot {
 	 * Run a u-boot command and return its console output.
 	 *
 	 * `oem console <cmd>` resets u-boot's console ring buffer, runs the command,
-	 * then replays the buffer as INFO packets — so it's execute-and-read in a
+	 * then replays the buffer as INFO packets, so it's execute-and-read in a
 	 * single round trip. Note it reports the *drain* succeeding, not the command:
 	 * a u-boot command that fails still comes back OKAY, with the complaint in
 	 * the output. Callers that care have to read the text.
@@ -300,7 +300,7 @@ export class Fastboot {
 		await this.expect('reboot-bootloader');
 	}
 
-	/** Hand the device back to the boot ROM (1b8e:c003) — our u-boot's `oem maskrom`. */
+	/** Hand the device back to the boot ROM (1b8e:c003) via our u-boot's `oem maskrom`. */
 	async rebootMaskrom(): Promise<void> {
 		await this.expect('oem maskrom');
 	}

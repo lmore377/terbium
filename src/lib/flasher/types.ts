@@ -22,7 +22,7 @@ export interface FlashProgress {
  * Progress accounting for one flash step.
  *
  * `rateKiBps` is measured over the most recent report so the UI reacts to the
- * device slowing down, while `avgRateKiBps` and the ETA use the whole run —
+ * device slowing down, while `avgRateKiBps` and the ETA use the whole run;
  * an ETA driven by the instantaneous rate jitters uselessly. Skipped bytes
  * count toward completion but not toward either rate; they were never sent.
  */

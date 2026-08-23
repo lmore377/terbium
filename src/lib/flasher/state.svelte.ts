@@ -110,7 +110,7 @@ export class Flasher {
 	 *
 	 * A device already running our u-boot shows up as 18d1:fada and we just
 	 * talk to it. A stock or bricked one only offers the SoC boot ROM
-	 * (1b8e:c003), which speaks nothing but the amlogic protocol — so we use it
+	 * (1b8e:c003), which speaks nothing but the amlogic protocol, so we use it
 	 * exactly once to load our signed bootloader into RAM. That bootloader sees
 	 * it was started over USB and enters fastboot on its own, and everything
 	 * from there is fastboot.
@@ -416,7 +416,7 @@ async function requestSupportedDevice(): Promise<USBDevice> {
  * Wait for the device to reappear in fastboot after the bootloader starts.
  *
  * It usually needs a fresh permission grant (no serial number, so the browser
- * sees a new device), which only a user gesture can provide — the UI offers a
+ * sees a new device), which only a user gesture can provide; the UI offers a
  * button for that while this polls.
  */
 async function waitForFastbootDevice(timeoutMs: number): Promise<USBDevice> {

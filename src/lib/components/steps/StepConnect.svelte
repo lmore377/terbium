@@ -72,9 +72,9 @@
 			</h2>
 			<p class="mt-3 max-w-[56ch] text-base/7 text-pretty text-muted-foreground sm:text-sm/6">
 				Your browser will ask which USB device to use. Pick
-				<span class="font-medium whitespace-nowrap text-foreground">GX-CHIP</span> — or
+				<span class="font-medium whitespace-nowrap text-foreground">GX-CHIP</span> (or
 				<span class="font-medium whitespace-nowrap text-foreground">Superbird</span> if your device is
-				already in fastboot — and hit connect.
+				already in fastboot) and hit connect.
 			</p>
 		</div>
 

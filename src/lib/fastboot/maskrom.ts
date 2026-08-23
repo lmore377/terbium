@@ -1,11 +1,11 @@
-// Amlogic mask-ROM USB protocol — the *only* amlogic code left in terbium.
+// Amlogic mask-ROM USB protocol: the *only* amlogic code left in terbium.
 //
 // The SoC's boot ROM is burned in silicon and speaks nothing but this, so a
 // stock (or bricked) Car Thing has to be met on its own terms exactly once.
 // We use it for a single job: stream a mask-ROM-signed BL2 into SRAM, kick it
 // off, and feed it our signed FIP over the AMLC handshake. Our u-boot then
 // comes up in DRAM, notices it was booted over USB, and drops straight into
-// fastboot — after which every other operation in terbium is fastboot.
+// fastboot, after which every other operation in terbium is fastboot.
 //
 // Deliberately *not* ported from the old amlogic path: bulkcmd, partition
 // tables, restorePartition, writeUserArea, the whole vendor burn-mode u-boot.
@@ -25,7 +25,7 @@ const REQ_GET_AMLC = 0x50;
 const REQ_WRITE_AMLC = 0x60;
 
 // pyamlboot ORs this into the run-address payload. Without it the mask ROM
-// silently NOPs — no STALL, no error — and the following AMLC read hangs.
+// silently NOPs (no STALL, no error) and the following AMLC read hangs.
 // Empirically required on G12A.
 const FLAG_KEEP_POWER_ON = 0x10;
 

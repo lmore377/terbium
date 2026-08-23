@@ -2,14 +2,14 @@
 //
 // A stock `bootloader.dump` is a bare bootloader image: signed BL2 first, then
 // the FIP. That is *not* what the SoC expects to find on eMMC. Both places a
-// bootloader lives — the eMMC boot hwparts and the user-area mirror at LBA 0 —
+// bootloader lives (the eMMC boot hwparts and the user-area mirror at LBA 0)
 // hold a 512-byte info sector first, so that BL2 itself begins at LBA 1. The
 // mask ROM reads BL2 from LBA 1, not LBA 0.
 //
 // Vendor u-boot builds that info sector itself, which is why `amlmmc write
 // bootloader` can be handed a bare dump. Nothing outside vendor u-boot does, so
 // anything writing a bootloader over fastboot (or any other raw path) has to
-// prepend it — a bare dump written at offset 0 puts every byte one sector early
+// prepend it: a bare dump written at offset 0 puts every byte one sector early
 // and simply will not boot, while reading back byte-perfect.
 
 import type { Bytes } from '$lib/bytes';
@@ -22,7 +22,7 @@ export const INFO_SECTOR_BYTES = 512;
  * returns.
  *
  * This is the size of a stock `bootloader.dump`, so it is also the right bound
- * for "is this payload a bootloader or a whole-disk image?" — which is what
+ * for "is this payload a bootloader or a whole-disk image?", which is what
  * `withInfoSector` uses it for. It is *not* what gets written to a boot
  * hwpart; see `BOOT_HWPART_BYTES`.
  */
@@ -44,8 +44,8 @@ export const BOOT_HWPART_BYTES = 2 * 1024 * 1024;
  * First bytes of the *stock* Car Thing BL2.
  *
  * Kept only as a cross-check and a landmark when reading hex dumps. It is
- * tempting to use as an "is this a bare image?" test — every bootloader we
- * shipped starts with it — but they are all derived from the same stock BL2,
+ * tempting to use as an "is this a bare image?" test, since every bootloader we
+ * shipped starts with it, but they are all derived from the same stock BL2,
  * and BL2 is encrypted, so these are one build's first ciphertext block rather
  * than a magic. A differently-signed bootloader (an 8.9.2 thinglabs dump, say)
  * shares none of it. Testing for it treats every other build as already
@@ -61,7 +61,7 @@ const INFO_SECTOR_RESERVED_FROM = 0x18;
  *
  * Detecting the sector is far more reliable than detecting the bootloader
  * behind it. BL2 is encrypted, so its leading bytes differ per build and per
- * signing key and can't be recognised at all; an info sector is a fixed shape —
+ * signing key and can't be recognised at all; an info sector is a fixed shape:
  * a handful of small header fields, ~480 bytes of zero padding, and a checksum
  * of everything ahead of it in the last word. High-entropy ciphertext does not
  * accidentally take that shape.
@@ -86,8 +86,8 @@ function hasInfoSector(data: Bytes): boolean {
 /**
  * Build the info sector for a Car Thing.
  *
- * This is amlogic's `storage_emmc_boot_info`. BL2 never reads it — its only job
- * is to occupy LBA 0 as a spacer, and an all-zero sector boots just as well —
+ * This is amlogic's `storage_emmc_boot_info`. BL2 never reads it; its only job
+ * is to occupy LBA 0 as a spacer, and an all-zero sector boots just as well,
  * but a well-formed one is free and keeps the image byte-compatible with vendor
  * tooling. The values are the ones read off a Car Thing that boots.
  */
@@ -97,7 +97,7 @@ export function infoSector(): Uint8Array {
 
 	view.setUint32(0x000, 1, true); // version
 	view.setUint32(0x004, 0x12000, true); // rsv_base_addr, in sectors: the reserved region at 36 MiB
-	view.setUint32(0x008, 0, true); // dtb.addr — vendor leaves these zero
+	view.setUint32(0x008, 0, true); // dtb.addr, vendor leaves these zero
 	view.setUint32(0x00c, 0, true); // dtb.size
 	view.setUint32(0x010, 0x4000, true); // ddr.addr, in sectors, relative to the reserved region
 	view.setUint32(0x014, 4, true); // ddr.size, in sectors
@@ -114,7 +114,7 @@ export function infoSector(): Uint8Array {
 
 /**
  * Whether `data` is a bare bootloader image that still needs an info sector in
- * front of it — i.e. anything that isn't already carrying one.
+ * front of it, i.e. anything that isn't already carrying one.
  *
  * Defaulting to "bare" is deliberate. Getting it wrong in this direction writes
  * a spurious 512 bytes ahead of an image that didn't need it, which is visible
