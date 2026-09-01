@@ -10,7 +10,8 @@
 //   writeBootPartition  flash:mmc0boot0 / flash:mmc0boot1  (+ hwpart reset)
 //   restorePartition    the stock partition's LBA range, else a GPT name
 //   ├─ named bootloader info sector + image, to user-area LBA 0 and both hwparts
-//   writeEnv            download + `env import -t` + `saveenv`
+//   writeEnv            download + `env import -t` + `saveenv`, falling back to a
+//                       vendor-format image at the stock env LBA on amlogic layouts
 //   bulkcmd             rewritten vendor command via `oem console`
 //   identify            getvar
 //   bl2Boot & friends   dropped, the bootstrap happens at connect time
@@ -30,6 +31,7 @@ import {
 	needsInfoSector,
 	toBootImage
 } from '$lib/fastboot/boot-image';
+import { parseEnvText, vendorEnvImage } from '$lib/fastboot/uboot-env';
 import type { FlashArchive } from './archive';
 import { ProgressTracker, StreamChunker, type FlashProgress, type StreamSource } from './types';
 
@@ -405,7 +407,18 @@ export async function runFlashConfig(
 
 			case 'writeEnv': {
 				const text = await textValue(archive, step.value);
-				await writeEnv(fastboot, text, { signal, onLog });
+				const { saved } = await writeEnv(fastboot, text, { signal, onLog });
+				if (!saved) {
+					// The vendor bootloader this archive restores reads the stock env
+					// partition, which our saveenv can't reach; hand it an image in
+					// its own format instead.
+					onLog?.('writing the environment to the stock env partition instead');
+					const image = vendorEnvImage(parseEnvText(text));
+					await flashRaw(fastboot, STOCK_PARTITIONS.env.offset, inlineSource(image), {
+						signal,
+						onProgress: emit
+					});
+				}
 				break;
 			}
 
@@ -665,8 +678,9 @@ async function flashByName(
  * partition table. An archive restoring a vendor layout therefore leaves no
  * `env` partition we can see and `saveenv` has nowhere to go, which is an
  * expected outcome of that restore rather than a failed flash, so it's reported
- * and stepped over. The import itself still applied, and a vendor-layout device
- * reads its environment from the `env` partition the archive restored anyway.
+ * and stepped over with `saved: false`; the caller decides whether the vendor
+ * env partition needs writing by hand (see `vendorEnvImage`). The import
+ * itself still applied to the running u-boot.
  */
 export async function writeEnv(
 	fastboot: Fastboot,
@@ -676,7 +690,7 @@ export async function writeEnv(
 		save?: boolean;
 		onLog?: (message: string) => void;
 	} = {}
-): Promise<void> {
+): Promise<{ saved: boolean }> {
 	const normalised = env.endsWith('\n') ? env : `${env}\n`;
 	const bytes = new TextEncoder().encode(normalised);
 	await fastboot.download(bytes, { signal: options.signal });
@@ -686,17 +700,19 @@ export async function writeEnv(
 	if (/error|failed|unknown command/i.test(output)) {
 		throw new Error(`the bootloader rejected the environment: ${output.trim()}`);
 	}
-	if (options.save !== false) {
-		const saved = await fastboot.console('saveenv');
-		if (NO_ENV_PARTITION.test(saved)) {
-			options.onLog?.(
-				'there is no env partition this bootloader can see, so the environment was not saved; ' +
-					'expected when the image being restored uses the amlogic partition table'
-			);
-		} else if (/error|failed/i.test(saved)) {
-			throw new Error(`saving the environment failed: ${saved.trim()}`);
-		}
+	if (options.save === false) return { saved: false };
+	const saved = await fastboot.console('saveenv');
+	if (NO_ENV_PARTITION.test(saved)) {
+		options.onLog?.(
+			'there is no env partition this bootloader can see, so saveenv had nowhere to go; ' +
+				'expected when the image being restored uses the amlogic partition table'
+		);
+		return { saved: false };
 	}
+	if (/error|failed/i.test(saved)) {
+		throw new Error(`saving the environment failed: ${saved.trim()}`);
+	}
+	return { saved: true };
 }
 
 /**

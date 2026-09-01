@@ -335,8 +335,8 @@ export class Flasher {
 
 	async writeEnv(env: string, save: boolean): Promise<void> {
 		if (!this.device) throw new Error('not connected');
-		await writeEnv(this.device, env, { save });
-		this.log(save ? 'environment written and saved' : 'environment written');
+		const { saved } = await writeEnv(this.device, env, { save, onLog: (m) => this.log(m) });
+		this.log(saved ? 'environment written and saved' : 'environment written');
 	}
 
 	/** Boot the firmware that's on the device now, leaving fastboot behind. */
@@ -401,7 +401,9 @@ export class Flasher {
 /** Prompt for either a device already in fastboot or one sitting in the boot ROM. */
 async function requestSupportedDevice(): Promise<USBDevice> {
 	const paired = await navigator.usb.getDevices().catch(() => [] as USBDevice[]);
-	const alreadyPaired = paired.find((device) => isFastbootDevice(device) || isMaskromDevice(device));
+	const alreadyPaired = paired.find(
+		(device) => isFastbootDevice(device) || isMaskromDevice(device)
+	);
 	if (alreadyPaired) return alreadyPaired;
 
 	return navigator.usb.requestDevice({
