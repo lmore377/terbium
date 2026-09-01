@@ -449,6 +449,8 @@ export async function runFlashConfig(
 			// Mask-ROM-only steps. An archive carrying these is describing its own
 			// bootstrap, which terbium now performs at connect time instead; by
 			// the time we get here the device is already running our u-boot.
+			// The memory writes also show up as staging for a vendor `store`
+			// command, which is dropped by translateVendorCommand.
 			case 'bl2Boot':
 			case 'run':
 			case 'writeSimpleMemory':
@@ -717,8 +719,13 @@ export function translateVendorCommand(command: string): string | null {
 	const trimmed = command.trim();
 
 	// Vendor partition-table / key-enclave setup: no equivalent, and nothing
-	// downstream depends on it once we're writing raw LBAs.
-	if (/^(amlmmc\s+(key|part|partition)|disk_initial)\b/i.test(trimmed)) return null;
+	// downstream depends on it once we're writing raw LBAs. `store dtb write`
+	// commits a dtb staged in RAM by a (skipped) writeLargeMemory into the
+	// amlogic dtb slots, and `store init` re-reads the partition table out of
+	// it; archives that do this restore those slots by raw LBA anyway.
+	if (/^(amlmmc\s+(key|part|partition)|disk_initial|store\s+(dtb|init))\b/i.test(trimmed)) {
+		return null;
+	}
 
 	// Vendor burn-mode numbers the eMMC as device 1.
 	if (/^mmc\s+dev\s+1\b/i.test(trimmed)) return 'mmc dev 0 0';
