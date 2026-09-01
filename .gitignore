@@ -25,3 +25,4 @@ vite.config.ts.timestamp-*
 # Firmware build inputs
 /firmware/stock/*
 !/firmware/stock/meta.json
+scratch/
